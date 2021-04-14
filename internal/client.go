@@ -27,7 +27,6 @@ package internal
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"time"
 
@@ -37,7 +36,6 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/grpc"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common/metrics"
@@ -586,10 +584,6 @@ func NewClient(options ClientOptions) (Client, error) {
 		return nil, err
 	}
 
-	if err = checkHealth(connection, options.ConnectionOptions); err != nil {
-		return nil, err
-	}
-
 	return NewServiceClient(workflowservice.NewWorkflowServiceClient(connection), connection, options), nil
 }
 
@@ -651,10 +645,6 @@ func NewNamespaceClient(options ClientOptions) (NamespaceClient, error) {
 		return nil, err
 	}
 
-	if err = checkHealth(connection, options.ConnectionOptions); err != nil {
-		return nil, err
-	}
-
 	return newNamespaceServiceClient(workflowservice.NewWorkflowServiceClient(connection), connection, options), nil
 }
 
@@ -691,36 +681,4 @@ func NewValue(data *commonpb.Payloads) converter.EncodedValue {
 //   NewValues(data).Get(&result1, &result2)
 func NewValues(data *commonpb.Payloads) converter.EncodedValues {
 	return newEncodedValues(data, nil)
-}
-
-// checkHealth checks service health using gRPC health check:
-// https://github.com/grpc/grpc/blob/master/doc/health-checking.md
-func checkHealth(connection grpc.ClientConnInterface, options ConnectionOptions) error {
-	if options.DisableHealthCheck {
-		return nil
-	}
-
-	healthClient := healthpb.NewHealthClient(connection)
-
-	request := &healthpb.HealthCheckRequest{
-		Service: healthCheckServiceName,
-	}
-
-	healthCheckTimeout := options.HealthCheckTimeout
-	if healthCheckTimeout == 0 {
-		healthCheckTimeout = defaultHealthCheckTimeout
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
-	defer cancel()
-	resp, err := healthClient.Check(ctx, request)
-	if err != nil {
-		return fmt.Errorf("health check error: %w", err)
-	}
-
-	if resp.Status != healthpb.HealthCheckResponse_SERVING {
-		return fmt.Errorf("health check returned unhealthy status: %v", resp.Status)
-	}
-
-	return nil
 }
