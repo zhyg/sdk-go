@@ -69,7 +69,8 @@ func TestProtoJsonPayloadConverter_Gogo(t *testing.T) {
 	assert.Equal(t, int64(1978), wt3.EventId)
 
 	s := pc.ToString(payload)
-	assert.Equal(t, `{"eventId":"1978","eventType":"WorkflowTaskTimedOut","workflowTaskTimedOutEventAttributes":{"scheduledEventId":"2","timeoutType":"ScheduleToStart"}}`, s)
+	// assert.Equal(t, `{"eventId":"1978","eventType":"WorkflowTaskTimedOut","workflowTaskTimedOutEventAttributes":{"scheduledEventId":"2","timeoutType":"ScheduleToStart"}}`, s)
+	assert.Equal(t, `{"eventId":"1978","eventType":8,"workflowTaskTimedOutEventAttributes":{"scheduledEventId":"2","timeoutType":2}}`, s)
 }
 
 func TestProtoJsonPayloadConverter_Google(t *testing.T) {
@@ -102,7 +103,8 @@ func TestProtoJsonPayloadConverter_Google(t *testing.T) {
 	assert.Equal(t, int64(12), wt4.BirthDay)
 
 	s := pc.ToString(payload)
-	assert.Equal(t, `{"name":"qwe","birthDay":"12","type":"TYPEV2_R","valueS":"asd"}`, strings.Replace(s, " ", "", -1))
+	// assert.Equal(t, `{"name":"qwe","birthDay":"12","type":"TYPEV2_R","valueS":"asd"}`, strings.Replace(s, " ", "", -1))
+	assert.Equal(t, `{"name":"qwe","birthDay":"12","type":1,"valueS":"asd"}`, strings.Replace(s, " ", "", -1))
 }
 
 func TestProtoPayloadConverter_Gogo(t *testing.T) {

@@ -50,7 +50,7 @@ var (
 // NewProtoJSONPayloadConverter creates new instance of ProtoJSONPayloadConverter.
 func NewProtoJSONPayloadConverter() *ProtoJSONPayloadConverter {
 	return &ProtoJSONPayloadConverter{
-		gogoMarshaler:   gogojsonpb.Marshaler{},
+		gogoMarshaler:   gogojsonpb.Marshaler{EnumsAsInts: true},
 		gogoUnmarshaler: gogojsonpb.Unmarshaler{},
 	}
 }

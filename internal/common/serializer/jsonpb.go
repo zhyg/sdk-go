@@ -44,7 +44,7 @@ type (
 // NewJSONPBEncoder creates a new JSONPBEncoder.
 func NewJSONPBEncoder() *JSONPBEncoder {
 	return &JSONPBEncoder{
-		marshaler:   jsonpb.Marshaler{},
+		marshaler:   jsonpb.Marshaler{EnumsAsInts: true},
 		unmarshaler: jsonpb.Unmarshaler{},
 	}
 }
