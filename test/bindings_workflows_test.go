@@ -52,7 +52,7 @@ func (wd *EmptyWorkflowDefinition) Execute(env bindings.WorkflowEnvironment, hea
 	env.Complete(payload, err)
 }
 
-func (wd *EmptyWorkflowDefinition) OnWorkflowTaskStarted() {
+func (wd *EmptyWorkflowDefinition) OnWorkflowTaskStarted(_ time.Duration) {
 
 }
 
@@ -77,8 +77,8 @@ type SingleActivityWorkflowDefinition struct {
 
 func (d *SingleActivityWorkflowDefinition) Execute(env bindings.WorkflowEnvironment, header *commonpb.Header, input *commonpb.Payloads) {
 	var signalInput string
-	env.RegisterSignalHandler(func(name string, input *commonpb.Payloads) {
-		_ = converter.GetDefaultDataConverter().FromPayloads(input, &signalInput)
+	env.RegisterSignalHandler(func(name string, input *commonpb.Payloads, header *commonpb.Header) error {
+		return converter.GetDefaultDataConverter().FromPayloads(input, &signalInput)
 	})
 	d.callbacks = append(d.callbacks, func() {
 		env.NewTimer(time.Second, d.addCallback(func(result *commonpb.Payloads, err error) {
@@ -151,7 +151,7 @@ func (d *SingleActivityWorkflowDefinition) addCallback(callback bindings.ResultH
 	}
 }
 
-func (d *SingleActivityWorkflowDefinition) OnWorkflowTaskStarted() {
+func (d *SingleActivityWorkflowDefinition) OnWorkflowTaskStarted(_ time.Duration) {
 	for _, callback := range d.callbacks {
 		callback()
 	}

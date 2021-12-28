@@ -114,8 +114,11 @@ type (
 		// default: 5s
 		StickyScheduleToStartTimeout time.Duration
 
-		// Optional: sets context for activity. The context can be used to pass any configuration to activity
-		// like common logger for all activities.
+		// Optional: sets root context for all activities. The context can be used to pass external dependencies
+		// like DB connections to activity functions.
+		// Note that this method of passing dependencies is not recommended anymore.
+		// Instead, use a structure with fields that contain dependencies and activities
+		// as the structure member functions. Then pass all the dependencies on the structure initialization.
 		BackgroundActivityContext context.Context
 
 		// Optional: Sets how workflow worker deals with non-deterministic history events
@@ -144,10 +147,6 @@ type (
 		// default: 1000
 		MaxConcurrentSessionExecutionSize int
 
-		// Optional: Specifies factories used to instantiate workflow interceptor chain
-		// The chain is instantiated per each replay of a workflow execution
-		WorkflowInterceptorChainFactories []WorkflowInterceptor
-
 		// Optional: If set to true worker would only handle workflow tasks and local activities.
 		// Non-local activities will not be executed by this worker.
 		// default: false
@@ -156,6 +155,28 @@ type (
 		// Optional: If set overwrites the client level Identify value.
 		// default: client identity
 		Identity string
+
+		// Optional: If set defines maximum amount of time that workflow task will be allowed to run. Defaults to 1 sec.
+		DeadlockDetectionTimeout time.Duration
+
+		// Optional: The maximum amount of time between sending each pending heartbeat to the server. Regardless of
+		// heartbeat timeout, no pending heartbeat will wait longer than this amount of time to send.
+		// default: 60 seconds
+		MaxHeartbeatThrottleInterval time.Duration
+
+		// Optional: The default amount of time between sending each pending heartbeat to the server. This is used if the
+		// ActivityOptions do not provide a HeartbeatTimeout. Otherwise, the interval becomes a value a bit smaller than the
+		// given HeartbeatTimeout.
+		// default: 30 seconds
+		DefaultHeartbeatThrottleInterval time.Duration
+
+		// Interceptors to apply to the worker. Earlier interceptors wrap later
+		// interceptors.
+		//
+		// When worker interceptors are here and in client options, the ones in
+		// client options wrap the ones here. The same interceptor should not be set
+		// here and in client options.
+		Interceptors []WorkerInterceptor
 	}
 )
 
@@ -195,7 +216,6 @@ func NewWorker(
 	taskQueue string,
 	options WorkerOptions,
 ) *AggregatedWorker {
-	// TODO: refactor and remove this downcast: https://github.com/temporalio/go-sdk/issues/70
 	workflowClient, ok := client.(*WorkflowClient)
 	if !ok {
 		panic("Client must be created with client.NewClient()")

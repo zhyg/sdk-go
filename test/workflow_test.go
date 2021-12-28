@@ -28,7 +28,10 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
@@ -94,6 +97,40 @@ func (w *Workflows) Panicked(ctx workflow.Context) ([]string, error) {
 	panic("simulated")
 }
 
+func (w *Workflows) PanickedActivity(ctx workflow.Context, maxAttempts int32) (ret []string, err error) {
+	// Only retry limited number of times on activities
+	oneRetry := &temporal.RetryPolicy{InitialInterval: 1 * time.Nanosecond, MaximumAttempts: maxAttempts}
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Second,
+		RetryPolicy:         oneRetry,
+	})
+	ctx = workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
+		StartToCloseTimeout: 5 * time.Second,
+		RetryPolicy:         oneRetry,
+	})
+
+	var a Activities
+
+	// Panic activity
+	err = workflow.ExecuteActivity(ctx, a.Panicked).Get(ctx, nil)
+	var actPanicErr *temporal.PanicError
+	if !errors.As(err, &actPanicErr) {
+		return nil, fmt.Errorf("no activity panic error, got: %v", err)
+	}
+
+	// Panic local activity
+	err = workflow.ExecuteLocalActivity(ctx, a.Panicked).Get(ctx, nil)
+	var localActPanicErr *temporal.PanicError
+	if !errors.As(err, &localActPanicErr) {
+		return nil, fmt.Errorf("no local activity error, got: %v", err)
+	}
+
+	return []string{
+		"act err: " + actPanicErr.Error(),
+		"local act err: " + localActPanicErr.Error(),
+	}, nil
+}
+
 func (w *Workflows) ActivityRetryOnError(ctx workflow.Context) ([]string, error) {
 	ctx = workflow.WithActivityOptions(ctx, w.defaultActivityOptionsWithRetry())
 	startTime := workflow.Now(ctx)
@@ -117,6 +154,30 @@ func (w *Workflows) ActivityRetryOnError(ctx workflow.Context) ([]string, error)
 	}
 
 	return []string{"fail", "fail", "fail"}, nil
+}
+
+func (w *Workflows) CallUnregisteredActivityRetry(ctx workflow.Context) (string, error) {
+	ctx = workflow.WithActivityOptions(ctx, w.defaultActivityOptionsWithRetry())
+	startTime := workflow.Now(ctx)
+	err := workflow.ExecuteActivity(ctx, "Unknown").Get(ctx, nil)
+	if err == nil {
+		return "", fmt.Errorf("expected activity to fail but succeeded")
+	}
+
+	elapsed := workflow.Now(ctx).Sub(startTime)
+	if elapsed < 2*time.Second {
+		return "", fmt.Errorf("expected activity to be retried on failure, but it was not")
+	}
+
+	var applicationErr *temporal.ApplicationError
+	ok := errors.As(err, &applicationErr)
+	if !ok {
+		return "", fmt.Errorf("activity failed with unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(applicationErr.Error(), "unable to find activityType=Unknown") {
+		return "", fmt.Errorf("unexpected error type")
+	}
+	return "done", nil
 }
 
 func (w *Workflows) ActivityRetryOptionsChange(ctx workflow.Context) ([]string, error) {
@@ -170,7 +231,7 @@ func (w *Workflows) ActivityRetryOnTimeout(ctx workflow.Context, timeoutType enu
 
 func (w *Workflows) LongRunningActivityWithHB(ctx workflow.Context) ([]string, error) {
 	opts := w.defaultActivityOptionsWithRetry()
-	opts.HeartbeatTimeout = 3 * time.Second
+	opts.HeartbeatTimeout = 2 * time.Second
 	opts.ScheduleToCloseTimeout = time.Second * 12
 	opts.StartToCloseTimeout = time.Second * 12
 	opts.RetryPolicy = &internal.RetryPolicy{
@@ -178,7 +239,7 @@ func (w *Workflows) LongRunningActivityWithHB(ctx workflow.Context) ([]string, e
 	}
 	ctx = workflow.WithActivityOptions(ctx, opts)
 
-	err := workflow.ExecuteActivity(ctx, "LongRunningHeartbeat", 8*time.Second, 300*time.Millisecond).Get(ctx, nil)
+	err := workflow.ExecuteActivity(ctx, "LongRunningHeartbeat", 8*time.Second, 200*time.Millisecond).Get(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("expected activity to succeed but it failed: %v", err)
 	}
@@ -188,21 +249,32 @@ func (w *Workflows) LongRunningActivityWithHB(ctx workflow.Context) ([]string, e
 
 func (w *Workflows) ActivityRetryOnHBTimeout(ctx workflow.Context) ([]string, error) {
 	opts := workflow.ActivityOptions{
-		ScheduleToStartTimeout: 10 * time.Second,
-		ScheduleToCloseTimeout: 10 * time.Second,
-		StartToCloseTimeout:    3 * time.Second,
-		HeartbeatTimeout:       time.Second,
+		ScheduleToStartTimeout: 5 * time.Second,
+		ScheduleToCloseTimeout: 15 * time.Second,
+		StartToCloseTimeout:    5 * time.Second,
+		HeartbeatTimeout:       3 * time.Second,
 		RetryPolicy: &temporal.RetryPolicy{
 			InitialInterval:    time.Second,
 			BackoffCoefficient: 1.0,
 			MaximumAttempts:    3,
 		},
 	}
-	opts.HeartbeatTimeout = time.Second
 	ctx = workflow.WithActivityOptions(ctx, opts)
 
 	var result int
-	err := workflow.ExecuteActivity(ctx, "HeartbeatAndSleep", 0, 3*time.Second).Get(ctx, &result)
+	// Activity "HeartbeatAndSleep" will heartbeat once and then sleep 5s. The first heartbeat will be reported
+	// immediately without delay/buffer. With the settings we have, below is timeline:
+	// 0s  activity starts (attempt 1).
+	// 0s  activity reports heartbeat.
+	// 3s  activity timeout due to missing heartbeat.
+	// 4s  activity retry attempt 2.
+	// 4s  activity reports heartbeat.
+	// 7s  activity timeout due to missing heartbeat.
+	// 8s  activity retry attempt 3.
+	// 8s  activity reports heartbeat.
+	// 11s activity timeout due to missing heartbeat.
+	// 11s activity close with heartbeat timeout error.
+	err := workflow.ExecuteActivity(ctx, "HeartbeatAndSleep", 0, 5*time.Second).Get(ctx, &result)
 	if err == nil {
 		return nil, fmt.Errorf("expected activity to fail but succeeded")
 	}
@@ -230,6 +302,18 @@ func (w *Workflows) ActivityRetryOnHBTimeout(ctx workflow.Context) ([]string, er
 	}
 
 	return []string{"heartbeatAndSleep", "heartbeatAndSleep", "heartbeatAndSleep"}, nil
+}
+
+func (w *Workflows) ActivityHeartbeatWithRetry(ctx workflow.Context) (heartbeatCounts int, err error) {
+	// Make retries fast
+	opts := w.defaultActivityOptions()
+	opts.RetryPolicy = &temporal.RetryPolicy{InitialInterval: 5 * time.Millisecond, BackoffCoefficient: 1}
+	ctx = workflow.WithActivityOptions(ctx, opts)
+
+	// Fail twice then succeed
+	err = workflow.ExecuteActivity(ctx, "HeartbeatTwiceAndFailNTimes", 2,
+		"activity-heartbeat-"+workflow.GetInfo(ctx).WorkflowExecution.ID).Get(ctx, &heartbeatCounts)
+	return
 }
 
 func (w *Workflows) ContinueAsNew(ctx workflow.Context, count int, taskQueue string) (int, error) {
@@ -302,7 +386,11 @@ func (w *Workflows) IDReusePolicy(
 
 	var ans2 string
 	if err := workflow.ExecuteChildWorkflow(ctx, w.child, "world", false).Get(ctx, &ans2); err != nil {
-		return "", err
+		// Expect it is a execution-already-started
+		if temporal.IsWorkflowExecutionAlreadyStartedError(err) {
+			return "", err
+		}
+		return "", fmt.Errorf("unexpected child workflow error: %w", err)
 	}
 
 	if parallel {
@@ -550,6 +638,22 @@ func (w *Workflows) CancelTimerAfterActivity(ctx workflow.Context) (string, erro
 	return res, err
 }
 
+var cancelTimerDeferCount uint32
+
+func (w *Workflows) CancelTimerViaDeferAfterWFTFailure(ctx workflow.Context) error {
+	timerCtx, canceller := workflow.WithCancel(ctx)
+	defer func() {
+		if atomic.AddUint32(&cancelTimerDeferCount, 1) == 1 {
+			panic("Intentional panic to trigger WFT failure")
+		}
+		canceller()
+	}()
+
+	_ = workflow.NewTimer(timerCtx, time.Second).Get(timerCtx, nil)
+
+	return nil
+}
+
 func (w *Workflows) CancelChildWorkflow(ctx workflow.Context) ([]string, error) {
 	childCtx1, cancelFunc1 := workflow.WithCancel(ctx)
 	opts := workflow.ChildWorkflowOptions{
@@ -569,6 +673,21 @@ func (w *Workflows) CancelChildWorkflow(ctx workflow.Context) ([]string, error) 
 	_ = workflow.ExecuteActivity(activityCtx2, "Prefix_ToUpper", "hello").Get(activityCtx2, nil)
 
 	return []string{"sleep", "toUpper"}, nil
+}
+
+func (w *Workflows) StartingChildAfterBeingCanceled(ctx workflow.Context) (bool, error) {
+	// schedule a timer, which will be cancelled, but ignore that cancel
+	_ = workflow.Sleep(ctx, 5*time.Minute)
+
+	ctx = workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		WorkflowExecutionTimeout: time.Second * 30,
+	})
+	childErr := workflow.ExecuteChildWorkflow(ctx, w.sleep, time.Second).Get(ctx, nil)
+	if childErr != nil {
+		return false, childErr
+	}
+
+	return true, nil
 }
 
 func (w *Workflows) CancelActivityImmediately(ctx workflow.Context) ([]string, error) {
@@ -785,7 +904,7 @@ func (w *Workflows) InspectLocalActivityInfo(ctx workflow.Context) error {
 	wfType := info.WorkflowType.Name
 	taskQueue := info.TaskQueueName
 	ctx = workflow.WithLocalActivityOptions(ctx, w.defaultLocalActivityOptions())
-	activities := Activities{}
+	var activities *Activities
 	return workflow.ExecuteLocalActivity(
 		ctx, activities.InspectActivityInfo, namespace, taskQueue, wfType).Get(ctx, nil)
 }
@@ -793,7 +912,7 @@ func (w *Workflows) InspectLocalActivityInfo(ctx workflow.Context) error {
 func (w *Workflows) WorkflowWithLocalActivityCtxPropagation(ctx workflow.Context) (string, error) {
 	ctx = workflow.WithLocalActivityOptions(ctx, w.defaultLocalActivityOptions())
 	ctx = workflow.WithValue(ctx, contextKey(testContextKey1), "test-data-in-context")
-	activities := Activities{}
+	var activities *Activities
 	var result string
 	err := workflow.ExecuteLocalActivity(ctx, activities.DuplicateStringInContext).Get(ctx, &result)
 	if err != nil {
@@ -804,7 +923,7 @@ func (w *Workflows) WorkflowWithLocalActivityCtxPropagation(ctx workflow.Context
 
 func (w *Workflows) WorkflowWithParallelLocalActivities(ctx workflow.Context) (string, error) {
 	ctx = workflow.WithLocalActivityOptions(ctx, w.defaultLocalActivityOptions())
-	activities := Activities{}
+	var activities *Activities
 	var futures []workflow.Future
 
 	for i := 0; i < 10; i++ {
@@ -828,7 +947,7 @@ func (w *Workflows) WorkflowWithParallelLocalActivities(ctx workflow.Context) (s
 func (w *Workflows) WorkflowWithLocalActivityStartWhenTimerCancel(ctx workflow.Context) (bool, error) {
 	timerCtx, cancelTimer := workflow.WithCancel(ctx)
 	ctx = workflow.WithActivityOptions(ctx, w.defaultActivityOptions())
-	activities := Activities{}
+	var activities *Activities
 	// Start a timer
 	_ = workflow.NewTimer(timerCtx, time.Second*3)
 
@@ -851,6 +970,7 @@ func (w *Workflows) WorkflowWithParallelLongLocalActivityAndHeartbeat(ctx workfl
 	ao := w.defaultLocalActivityOptions()
 	ao.ScheduleToCloseTimeout = 10 * time.Second
 	ctx = workflow.WithLocalActivityOptions(ctx, ao)
+	// Intentionally instantiating to test legacy path of non nil receiver.
 	activities := Activities{}
 	var futures []workflow.Future
 
@@ -880,7 +1000,52 @@ func (w *Workflows) WorkflowWithLocalActivityRetries(ctx workflow.Context) error
 		MaximumInterval:    time.Second * 5,
 	}
 	ctx = workflow.WithLocalActivityOptions(ctx, laOpts)
-	activities := Activities{}
+	var activities *Activities
+
+	var futures []workflow.Future
+	for i := 1; i <= 10; i++ {
+		la := workflow.ExecuteLocalActivity(ctx, activities.failNTimes, 2, i)
+		futures = append(futures, la)
+	}
+
+	for _, fut := range futures {
+		err := fut.Get(ctx, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Workflows) WorkflowWithLocalActivityRetriesAndDefaultRetryPolicy(ctx workflow.Context) error {
+	laOpts := w.defaultLocalActivityOptions()
+	// Don't set any retry policy
+	ctx = workflow.WithLocalActivityOptions(ctx, laOpts)
+	var activities *Activities
+
+	var futures []workflow.Future
+	for i := 1; i <= 10; i++ {
+		la := workflow.ExecuteLocalActivity(ctx, activities.failNTimes, 2, i)
+		futures = append(futures, la)
+	}
+
+	for _, fut := range futures {
+		err := fut.Get(ctx, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Workflows) WorkflowWithLocalActivityRetriesAndPartialRetryPolicy(ctx workflow.Context) error {
+	laOpts := w.defaultLocalActivityOptions()
+	// Set only max attempts and use defaults for other parameters.
+	laOpts.RetryPolicy = &internal.RetryPolicy{
+		MaximumAttempts: 3,
+	}
+	ctx = workflow.WithLocalActivityOptions(ctx, laOpts)
+	var activities *Activities
 
 	var futures []workflow.Future
 	for i := 1; i <= 10; i++ {
@@ -1135,23 +1300,321 @@ func (w *Workflows) CancelTimerConcurrentWithOtherCommandWorkflow(ctx workflow.C
 	return result, nil
 }
 
+func (w *Workflows) WaitSignalReturnParam(ctx workflow.Context, v interface{}) (interface{}, error) {
+	// Wait for signal before returning
+	s := workflow.NewSelector(ctx)
+	signalCh := workflow.GetSignalChannel(ctx, "done-signal")
+	s.AddReceive(signalCh, func(c workflow.ReceiveChannel, more bool) {
+		var ignore bool
+		c.Receive(ctx, &ignore)
+		workflow.GetLogger(ctx).Info("Received signal")
+	})
+	s.Select(ctx)
+	return v, nil
+}
+
+func (w *Workflows) ActivityWaitForWorkerStop(ctx workflow.Context, timeout time.Duration) (string, error) {
+	ctx = workflow.WithActivityOptions(ctx, w.defaultActivityOptions())
+	var s string
+	err := workflow.ExecuteActivity(ctx, "WaitForWorkerStop", timeout).Get(ctx, &s)
+	return s, err
+}
+
+func (w *Workflows) ActivityHeartbeatUntilSignal(ctx workflow.Context) error {
+	ch := workflow.GetSignalChannel(ctx, "cancel")
+	actCtx, actCancel := workflow.WithCancel(workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Hour,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+		WaitForCancellation: true,
+		HeartbeatTimeout:    1 * time.Second,
+	}))
+	var a *Activities
+	actFut := workflow.ExecuteActivity(actCtx, a.HeartbeatUntilCanceled, 100*time.Millisecond)
+
+	// Wait for signal then cancel
+	ch.Receive(ctx, nil)
+	actCancel()
+	return actFut.Get(ctx, nil)
+}
+
+func (w *Workflows) CancelChildAndExecuteActivityRace(ctx workflow.Context) error {
+	// This workflow replicates an issue where cancel was reported out of order
+	// with when it occurs. Specifically, this workflow creates a long-running
+	// child then signals its cancellation from a simulated goroutine and
+	// immediately starts an activity. Previously, the SDK would put the cancel
+	// command before the execute command since the child workflow started first.
+
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{StartToCloseTimeout: 2 * time.Minute})
+
+	// Start long-running child workflow
+	childCtx, childCancel := workflow.WithCancel(ctx)
+	childCtx = workflow.WithChildOptions(childCtx, workflow.ChildWorkflowOptions{WaitForCancellation: true})
+	child := workflow.ExecuteChildWorkflow(childCtx, w.SleepForDuration, 3*time.Minute)
+	if err := child.GetChildWorkflowExecution().Get(ctx, nil); err != nil {
+		return err
+	}
+
+	// Start "goroutine" to send to channel and immediately start activity
+	ch := workflow.NewChannel(ctx)
+	workflow.Go(ctx, func(ctx workflow.Context) {
+		ch.Send(ctx, nil)
+		if err := workflow.ExecuteActivity(ctx, new(Activities).Sleep, 1*time.Millisecond).Get(ctx, nil); err != nil {
+			panic(err)
+		}
+	})
+
+	// Wait for channel and cancel child
+	ch.Receive(ctx, nil)
+	childCancel()
+	_ = child.Get(ctx, nil)
+	return nil
+}
+
+func (w *Workflows) SleepForDuration(ctx workflow.Context, d time.Duration) error {
+	return workflow.Sleep(ctx, d)
+}
+
+func (w *Workflows) InterceptorCalls(ctx workflow.Context, someVal string) (string, error) {
+	someVal = "workflow(" + someVal + ")"
+
+	// Handle queries
+	err := workflow.SetQueryHandler(ctx, "query", func(arg string) (string, error) {
+		return "queryresult(" + arg + ")", nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// Exec activity
+	ctx = workflow.WithActivityOptions(ctx, w.defaultActivityOptions())
+	var a Activities
+	if err := workflow.ExecuteActivity(ctx, a.InterceptorCalls, someVal).Get(ctx, &someVal); err != nil {
+		return "", err
+	}
+
+	// Exec local activity
+	ctx = workflow.WithLocalActivityOptions(ctx, w.defaultLocalActivityOptions())
+	if err := workflow.ExecuteLocalActivity(ctx, a.Echo, 0, 0).Get(ctx, nil); err != nil {
+		return "", err
+	}
+
+	// Do a bunch of other calls ignoring failure
+	workflow.Go(ctx, func(workflow.Context) {})
+	workflow.ExecuteChildWorkflow(ctx, "badworkflow")
+	workflow.GetInfo(ctx)
+	workflow.GetLogger(ctx)
+	workflow.GetMetricsHandler(ctx)
+	workflow.Now(ctx)
+	workflow.NewTimer(ctx, 1*time.Millisecond)
+	_ = workflow.Sleep(ctx, 1*time.Millisecond)
+	_ = workflow.RequestCancelExternalWorkflow(ctx, "badid", "").Get(ctx, nil)
+	_ = workflow.SignalExternalWorkflow(ctx, "badid", "", "badsignal", nil).Get(ctx, nil)
+	_ = workflow.UpsertSearchAttributes(ctx, nil)
+	workflow.SideEffect(ctx, func(workflow.Context) interface{} { return "sideeffect" })
+	workflow.MutableSideEffect(ctx, "badid",
+		func(workflow.Context) interface{} { return "mutablesideeffect" }, reflect.DeepEqual)
+	workflow.GetVersion(ctx, "badchangeid", 2, 3)
+	workflow.IsReplaying(ctx)
+	workflow.HasLastCompletionResult(ctx)
+	_ = workflow.GetLastCompletionResult(ctx)
+	_ = workflow.GetLastError(ctx)
+	_ = workflow.NewContinueAsNewError(ctx, "badworkflow")
+
+	// Wait for signal
+	finishCh := workflow.GetSignalChannel(ctx, "finish")
+	var finishStr string
+	finishCh.Receive(ctx, &finishStr)
+	someVal = finishStr + "(" + someVal + ")"
+
+	return someVal, nil
+}
+
+func (w *Workflows) WaitSignalToStart(ctx workflow.Context) (string, error) {
+	var value string
+	workflow.GetSignalChannel(ctx, "start-signal").Receive(ctx, &value)
+	return value, nil
+}
+
+func (w *Workflows) SignalsAndQueries(ctx workflow.Context, execChild, execActivity bool) error {
+	// Add query handler
+	err := workflow.SetQueryHandler(ctx, "workflow-query", func() (string, error) { return "query-response", nil })
+	if err != nil {
+		return fmt.Errorf("failed setting query handler: %w", err)
+	}
+
+	// Wait for signal on start
+	workflow.GetSignalChannel(ctx, "start-signal").Receive(ctx, nil)
+
+	// Run child if requested
+	if execChild {
+		fut := workflow.ExecuteChildWorkflow(ctx, w.SignalsAndQueries, false, true)
+		// Signal child twice
+		if err := fut.SignalChildWorkflow(ctx, "start-signal", nil).Get(ctx, nil); err != nil {
+			return fmt.Errorf("failed signaling child with start: %w", err)
+		} else if err = fut.SignalChildWorkflow(ctx, "finish-signal", nil).Get(ctx, nil); err != nil {
+			return fmt.Errorf("failed signaling child with finish: %w", err)
+		}
+		// Wait for done
+		if err := fut.Get(ctx, nil); err != nil {
+			return fmt.Errorf("child failed: %w", err)
+		}
+	}
+
+	// Run activity if requested
+	if execActivity {
+		ctx = workflow.WithActivityOptions(ctx, w.defaultActivityOptions())
+		var a Activities
+		if err := workflow.ExecuteActivity(ctx, a.ExternalSignalsAndQueries).Get(ctx, nil); err != nil {
+			return fmt.Errorf("activity failed: %w", err)
+		}
+	}
+
+	// Wait for finish signal
+	workflow.GetSignalChannel(ctx, "finish-signal").Receive(ctx, nil)
+	return nil
+}
+
+type AdvancedPostCancellationInput struct {
+	PreCancelActivity  bool
+	PostCancelActivity bool
+	PreCancelTimer     bool
+	PostCancelTimer    bool
+}
+
+func (w *Workflows) AdvancedPostCancellation(ctx workflow.Context, in *AdvancedPostCancellationInput) error {
+	// Setup query to tell caller we're waiting for cancel
+	waitingForCancel := false
+	err := workflow.SetQueryHandler(ctx, "waiting-for-cancel", func() (bool, error) {
+		return waitingForCancel, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Minute,
+		HeartbeatTimeout:    5 * time.Second,
+		WaitForCancellation: true,
+	})
+	var a *Activities
+
+	// Start pre-cancel pieces
+	var actFut, timerFut workflow.Future
+	if in.PreCancelActivity {
+		actFut = workflow.ExecuteActivity(ctx, a.HeartbeatUntilCanceled, 1*time.Second)
+	}
+	if in.PreCancelTimer {
+		timerFut = workflow.NewTimer(ctx, 10*time.Minute)
+	}
+
+	// Set as waiting and wait for futures
+	waitingForCancel = true
+	if actFut != nil {
+		if err := actFut.Get(ctx, nil); err != nil {
+			return fmt.Errorf("activity did not gracefully cancel: %w", err)
+		}
+	}
+	if timerFut != nil {
+		if err := timerFut.Get(ctx, nil); !temporal.IsCanceledError(err) {
+			return fmt.Errorf("timer did not get canceled error, got: %w", err)
+		}
+	}
+
+	// Run post-cancel pieces with context not considered cancel
+	ctx, _ = workflow.NewDisconnectedContext(ctx)
+	if in.PostCancelActivity {
+		if err := workflow.ExecuteActivity(ctx, a.Sleep, 1*time.Millisecond).Get(ctx, nil); err != nil {
+			return fmt.Errorf("failed post-cancel activity: %w", err)
+		}
+	}
+	if in.PostCancelTimer {
+		if err := workflow.NewTimer(ctx, 1*time.Millisecond).Get(ctx, nil); err != nil {
+			return fmt.Errorf("failed post-cancel timer: %w", err)
+		}
+	}
+	return nil
+}
+
+func (w *Workflows) AdvancedPostCancellationChildWithDone(ctx workflow.Context) error {
+	// Setup query to tell caller we're waiting for cancel
+	waitingForCancel := false
+	err := workflow.SetQueryHandler(ctx, "waiting-for-cancel", func() (bool, error) {
+		return waitingForCancel, nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed setting query handler: %w", err)
+	}
+
+	// Start child but ignore future result
+	workflow.ExecuteChildWorkflow(ctx, w.SleepForDuration, 5*time.Hour)
+
+	// Mark as waiting for cancel and receive from done channel
+	waitingForCancel = true
+	ctx.Done().Receive(ctx, nil)
+
+	// Run after-cancel activity
+	ctx, _ = workflow.NewDisconnectedContext(ctx)
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Minute,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+	})
+	var a *Activities
+	if err := workflow.ExecuteActivity(ctx, a.Sleep, 1*time.Millisecond).Get(ctx, nil); err != nil {
+		return fmt.Errorf("failed post-cancel activity: %w", err)
+	}
+	return nil
+}
+
+type ParamsValue struct {
+	Param1 string
+	Param2 int
+	Param3 bool
+	Param4 struct{ SomeField string }
+	Param5 *ParamsValue
+	Param6 []byte
+	Child  *ParamsValue
+}
+
+func (w *Workflows) TooFewParams(
+	ctx workflow.Context,
+	param1 string,
+	param2 int,
+	param3 bool,
+	param4 struct{ SomeField string },
+	param5 *ParamsValue,
+	param6 []byte,
+) (*ParamsValue, error) {
+	ret := &ParamsValue{Param1: param1, Param2: param2, Param3: param3, Param4: param4, Param5: param5, Param6: param6}
+	// Execute activity with only the first param
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{ScheduleToCloseTimeout: 1 * time.Minute})
+	var a *Activities
+	return ret, workflow.ExecuteActivity(ctx, a.TooFewParams, param1).Get(ctx, &ret.Child)
+}
+
 func (w *Workflows) register(worker worker.Worker) {
 	worker.RegisterWorkflow(w.ActivityCancelRepro)
 	worker.RegisterWorkflow(w.ActivityCompletionUsingID)
+	worker.RegisterWorkflow(w.ActivityHeartbeatWithRetry)
 	worker.RegisterWorkflow(w.ActivityRetryOnError)
+	worker.RegisterWorkflow(w.CallUnregisteredActivityRetry)
 	worker.RegisterWorkflow(w.ActivityRetryOnHBTimeout)
 	worker.RegisterWorkflow(w.ActivityRetryOnTimeout)
 	worker.RegisterWorkflow(w.ActivityRetryOptionsChange)
+	worker.RegisterWorkflow(w.ActivityWaitForWorkerStop)
+	worker.RegisterWorkflow(w.ActivityHeartbeatUntilSignal)
 	worker.RegisterWorkflow(w.Basic)
 	worker.RegisterWorkflow(w.Deadlocked)
 	worker.RegisterWorkflow(w.DeadlockedWithLocalActivity)
 	worker.RegisterWorkflow(w.Panicked)
+	worker.RegisterWorkflow(w.PanickedActivity)
 	worker.RegisterWorkflow(w.BasicSession)
 	worker.RegisterWorkflow(w.CancelActivity)
 	worker.RegisterWorkflow(w.CancelActivityImmediately)
 	worker.RegisterWorkflow(w.CancelChildWorkflow)
+	worker.RegisterWorkflow(w.StartingChildAfterBeingCanceled)
 	worker.RegisterWorkflow(w.CancelTimer)
 	worker.RegisterWorkflow(w.CancelTimerAfterActivity)
+	worker.RegisterWorkflow(w.CancelTimerViaDeferAfterWFTFailure)
 	worker.RegisterWorkflow(w.CascadingCancellation)
 	worker.RegisterWorkflow(w.ChildWorkflowRetryOnError)
 	worker.RegisterWorkflow(w.ChildWorkflowRetryOnTimeout)
@@ -1170,9 +1633,12 @@ func (w *Workflows) register(worker worker.Worker) {
 	worker.RegisterWorkflow(w.LongRunningActivityWithHB)
 	worker.RegisterWorkflow(w.RetryTimeoutStableErrorWorkflow)
 	worker.RegisterWorkflow(w.SimplestWorkflow)
+	worker.RegisterWorkflow(w.WaitSignalReturnParam)
 	worker.RegisterWorkflow(w.WorkflowWithLocalActivityCtxPropagation)
 	worker.RegisterWorkflow(w.WorkflowWithParallelLongLocalActivityAndHeartbeat)
 	worker.RegisterWorkflow(w.WorkflowWithLocalActivityRetries)
+	worker.RegisterWorkflow(w.WorkflowWithLocalActivityRetriesAndDefaultRetryPolicy)
+	worker.RegisterWorkflow(w.WorkflowWithLocalActivityRetriesAndPartialRetryPolicy)
 	worker.RegisterWorkflow(w.WorkflowWithParallelLocalActivities)
 	worker.RegisterWorkflow(w.WorkflowWithLocalActivityStartWhenTimerCancel)
 	worker.RegisterWorkflow(w.WorkflowWithParallelSideEffects)
@@ -1181,6 +1647,14 @@ func (w *Workflows) register(worker worker.Worker) {
 	worker.RegisterWorkflow(w.CronWorkflow)
 	worker.RegisterWorkflow(w.CancelTimerConcurrentWithOtherCommandWorkflow)
 	worker.RegisterWorkflow(w.CancelMultipleCommandsOverMultipleTasks)
+	worker.RegisterWorkflow(w.CancelChildAndExecuteActivityRace)
+	worker.RegisterWorkflow(w.SleepForDuration)
+	worker.RegisterWorkflow(w.InterceptorCalls)
+	worker.RegisterWorkflow(w.WaitSignalToStart)
+	worker.RegisterWorkflow(w.SignalsAndQueries)
+	worker.RegisterWorkflow(w.AdvancedPostCancellation)
+	worker.RegisterWorkflow(w.AdvancedPostCancellationChildWithDone)
+	worker.RegisterWorkflow(w.TooFewParams)
 
 	worker.RegisterWorkflow(w.child)
 	worker.RegisterWorkflow(w.childForMemoAndSearchAttr)

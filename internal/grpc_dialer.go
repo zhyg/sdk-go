@@ -29,15 +29,15 @@ import (
 	"time"
 
 	"github.com/gogo/status"
-	"github.com/uber-go/tally"
+	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/internal/common/metrics"
+	"go.temporal.io/sdk/internal/common/retry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
-
-	"go.temporal.io/sdk/internal/common/metrics"
 )
 
 type (
@@ -59,6 +59,13 @@ const (
 
 	// minConnectTimeout is the minimum amount of time we are willing to give a connection to complete.
 	minConnectTimeout = 20 * time.Second
+
+	// attemptSuffix is a suffix added to the metric name for individual call attempts made to the server, which includes retries.
+	attemptSuffix = "_attempt"
+	// mb is a number of bytes in a megabyte
+	mb = 1024 * 1024
+	// defaultMaxPayloadSize is a maximum size of the payload that grpc client would allow.
+	defaultMaxPayloadSize = 64 * mb
 )
 
 func dial(params dialParameters) (*grpc.ClientConn, error) {
@@ -72,6 +79,11 @@ func dial(params dialParameters) (*grpc.ClientConn, error) {
 			grpc.WithInsecure(),
 			grpc.WithAuthority(params.UserConnectionOptions.Authority),
 		}
+	}
+
+	maxPayloadSize := defaultMaxPayloadSize
+	if params.UserConnectionOptions.MaxPayloadSize != 0 {
+		maxPayloadSize = params.UserConnectionOptions.MaxPayloadSize
 	}
 
 	// gRPC maintains connection pool inside grpc.ClientConn.
@@ -93,6 +105,8 @@ func dial(params dialParameters) (*grpc.ClientConn, error) {
 	}
 
 	opts = append(opts, securityOptions...)
+	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(maxPayloadSize)))
+	opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxPayloadSize)))
 
 	if params.UserConnectionOptions.EnableKeepAliveCheck {
 		// gRPC utilizes keep alive mechanism to detect dead connections in case if server didn't close them
@@ -105,15 +119,48 @@ func dial(params dialParameters) (*grpc.ClientConn, error) {
 		}
 		opts = append(opts, grpc.WithKeepaliveParams(kap))
 	}
+
+	// Append any user-supplied options
+	opts = append(opts, params.UserConnectionOptions.DialOptions...)
+
 	return grpc.Dial(params.HostPort, opts...)
 }
 
-func requiredInterceptors(metricScope tally.Scope, headersProvider HeadersProvider) []grpc.UnaryClientInterceptor {
-	interceptors := []grpc.UnaryClientInterceptor{metrics.NewScopeInterceptor(metricScope), errorInterceptor}
+func requiredInterceptors(
+	metricsHandler metrics.Handler,
+	headersProvider HeadersProvider,
+	controller TrafficController,
+) []grpc.UnaryClientInterceptor {
+	interceptors := []grpc.UnaryClientInterceptor{
+		errorInterceptor,
+		// Report aggregated metrics for the call, this is done outside of the retry loop.
+		metrics.NewGRPCInterceptor(metricsHandler, ""),
+		// By default the grpc retry interceptor *is disabled*, preventing accidental use of retries.
+		// We add call options for retry configuration based on the values present in the context.
+		retry.NewRetryOptionsInterceptor(),
+		// Performs retries *IF* retry options are set for the call.
+		grpc_retry.UnaryClientInterceptor(),
+		// Report metrics for every call made to the server.
+		metrics.NewGRPCInterceptor(metricsHandler, attemptSuffix),
+	}
 	if headersProvider != nil {
 		interceptors = append(interceptors, headersProviderInterceptor(headersProvider))
 	}
+	if controller != nil {
+		interceptors = append(interceptors, trafficControllerInterceptor(controller))
+	}
 	return interceptors
+}
+
+func trafficControllerInterceptor(controller TrafficController) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		err := controller.CheckCallAllowed(ctx, method, req, reply)
+		// Break execution chain and return an error without sending actual request to the server.
+		if err != nil {
+			return err
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
 }
 
 func headersProviderInterceptor(headersProvider HeadersProvider) grpc.UnaryClientInterceptor {

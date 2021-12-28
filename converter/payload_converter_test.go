@@ -34,6 +34,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 type testStruct struct {
@@ -103,8 +104,8 @@ func TestProtoJsonPayloadConverter_Google(t *testing.T) {
 	assert.Equal(t, int64(12), wt4.BirthDay)
 
 	s := pc.ToString(payload)
-	// assert.Equal(t, `{"name":"qwe","birthDay":"12","type":"TYPEV2_R","valueS":"asd"}`, strings.Replace(s, " ", "", -1))
-	assert.Equal(t, `{"name":"qwe","birthDay":"12","type":1,"valueS":"asd"}`, strings.Replace(s, " ", "", -1))
+	assert.Equal(t, `{"name":"qwe","birthDay":"12","type":"TYPEV2_R","valueS":"asd"}`, strings.Replace(s, " ", "", -1))
+	//assert.Equal(t, `{"name":"qwe","birthDay":"12","type":1,"valueS":"asd"}`, strings.Replace(s, " ", "", -1))
 }
 
 func TestProtoPayloadConverter_Gogo(t *testing.T) {
@@ -366,7 +367,93 @@ func TestProtoJsonPayloadConverter_FromPayload_Errors(t *testing.T) {
 	var wt7 interface{}
 	err = pc.FromPayload(payload, &wt7)
 	require.Error(t, err)
-	assert.Equal(t, "type: <nil>: type doesn't implement proto.Message", err.Error())
+	assert.Equal(t, "value type: interface {}: must be a concrete type, not interface", err.Error())
+	assert.True(t, errors.Is(err, ErrValuePtrMustConcreteType))
+
+	var wt8 proto.Message
+	err = pc.FromPayload(payload, &wt8)
+	require.Error(t, err)
+	assert.Equal(t, "value type: protoreflect.ProtoMessage: must be a concrete type, not interface", err.Error())
+	assert.True(t, errors.Is(err, ErrValuePtrMustConcreteType))
+
+	var wt9 string
+	err = pc.FromPayload(payload, &wt9)
+	require.Error(t, err)
+	assert.Equal(t, "type: *string: type doesn't implement proto.Message", err.Error())
+	assert.True(t, errors.Is(err, ErrTypeNotImplementProtoMessage))
+}
+
+func TestProtoPayloadConverter_FromPayload_Errors(t *testing.T) {
+	pc := NewProtoPayloadConverter()
+
+	wt := commonpb.WorkflowType{Name: "qwe"}
+	payload, err := pc.ToPayload(wt)
+	require.NoError(t, err)
+
+	var wt2 *int
+	err = pc.FromPayload(payload, &wt2)
+	require.Error(t, err)
+	assert.Equal(t, "type: *int: type doesn't implement proto.Message", err.Error())
+	assert.True(t, errors.Is(err, ErrTypeNotImplementProtoMessage))
+
+	var wt3 *commonpb.WorkflowType
+	err = pc.FromPayload(payload, wt3)
+	require.Error(t, err)
+	assert.Equal(t, "type: *common.WorkflowType: unable to set value", err.Error())
+	assert.True(t, errors.Is(err, ErrUnableToSetValue))
+
+	// But 31, 32, and 33 work
+	var wt31 commonpb.WorkflowType
+	err = pc.FromPayload(payload, &wt31)
+	require.NoError(t, err)
+	assert.Equal(t, "qwe", wt31.Name)
+
+	wt32 := &commonpb.WorkflowType{}
+	err = pc.FromPayload(payload, wt32)
+	require.NoError(t, err)
+	assert.Equal(t, "qwe", wt32.Name)
+
+	var wt33 *commonpb.WorkflowType //lint:ignore S1021 as it indicates exactly this case
+	wt33 = &commonpb.WorkflowType{}
+	err = pc.FromPayload(payload, wt33)
+	require.NoError(t, err)
+	assert.Equal(t, "qwe", wt33.Name)
+
+	var wt4 commonpb.WorkflowType
+	err = pc.FromPayload(payload, wt4)
+	require.Error(t, err)
+	assert.Equal(t, "type: common.WorkflowType: not a pointer type", err.Error())
+	assert.True(t, errors.Is(err, ErrValuePtrIsNotPointer))
+
+	var wt5 interface{}
+	err = pc.FromPayload(payload, wt5)
+	require.Error(t, err)
+	assert.Equal(t, "type: <nil>: not a pointer type", err.Error())
+	assert.True(t, errors.Is(err, ErrValuePtrIsNotPointer))
+
+	var wt6 *interface{}
+	err = pc.FromPayload(payload, wt6)
+	require.Error(t, err)
+	assert.Equal(t, "type: *interface {}: unable to set value", err.Error())
+	assert.True(t, errors.Is(err, ErrUnableToSetValue))
+
+	// supported by JSON serializer but not by ProtoJson
+	var wt7 interface{}
+	err = pc.FromPayload(payload, &wt7)
+	require.Error(t, err)
+	assert.Equal(t, "value type: interface {}: must be a concrete type, not interface", err.Error())
+	assert.True(t, errors.Is(err, ErrValuePtrMustConcreteType))
+
+	var wt8 proto.Message
+	err = pc.FromPayload(payload, &wt8)
+	require.Error(t, err)
+	assert.Equal(t, "value type: protoreflect.ProtoMessage: must be a concrete type, not interface", err.Error())
+	assert.True(t, errors.Is(err, ErrValuePtrMustConcreteType))
+
+	var wt9 string
+	err = pc.FromPayload(payload, &wt9)
+	require.Error(t, err)
+	assert.Equal(t, "type: *string: type doesn't implement proto.Message", err.Error())
 	assert.True(t, errors.Is(err, ErrTypeNotImplementProtoMessage))
 }
 

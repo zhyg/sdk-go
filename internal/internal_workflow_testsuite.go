@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -35,10 +36,8 @@ import (
 
 	"github.com/facebookgo/clock"
 	"github.com/golang/mock/gomock"
-	"github.com/opentracing/opentracing-go"
 	"github.com/robfig/cron"
 	"github.com/stretchr/testify/mock"
-	"github.com/uber-go/tally"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -50,6 +49,7 @@ import (
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common"
+	"go.temporal.io/sdk/internal/common/metrics"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
 )
@@ -66,6 +66,8 @@ const (
 	reservedTaskQueuePrefix = "/__temporal_sys/"
 	maxIDLengthLimit        = 1000
 	maxWorkflowTimeout      = 24 * time.Hour * 365 * 10
+
+	defaultMaximumAttemptsForUnitTest = 10
 )
 
 type (
@@ -116,7 +118,6 @@ type (
 		fn            interface{}
 		isWorkflow    bool
 		dataConverter converter.DataConverter
-		interceptors  []WorkflowInterceptor
 	}
 
 	taskQueueSpecificActivity struct {
@@ -131,13 +132,13 @@ type (
 
 		taskQueueSpecificActivities map[string]*taskQueueSpecificActivity
 
-		mock               *mock.Mock
-		service            workflowservice.WorkflowServiceClient
-		logger             log.Logger
-		metricsScope       tally.Scope
-		contextPropagators []ContextPropagator
-		identity           string
-		tracer             opentracing.Tracer
+		mock                      *mock.Mock
+		service                   workflowservice.WorkflowServiceClient
+		logger                    log.Logger
+		metricsHandler            metrics.Handler
+		contextPropagators        []ContextPropagator
+		identity                  string
+		detachedChildWaitDisabled bool
 
 		mockClock *clock.Mock
 		wallClock clock.Clock
@@ -183,17 +184,17 @@ type (
 		openSessions   map[string]*SessionInfo
 
 		workflowCancelHandler func()
-		signalHandler         func(name string, input *commonpb.Payloads)
-		queryHandler          func(string, *commonpb.Payloads) (*commonpb.Payloads, error)
+		signalHandler         func(name string, input *commonpb.Payloads, header *commonpb.Header) error
+		queryHandler          func(string, *commonpb.Payloads, *commonpb.Header) (*commonpb.Payloads, error)
 		startedHandler        func(r WorkflowExecution, e error)
 
-		isTestCompleted bool
-		testResult      converter.EncodedValue
-		testError       error
-		doneChannel     chan struct{}
-		workerOptions   WorkerOptions
-		dataConverter   converter.DataConverter
-		runTimeout      time.Duration
+		isWorkflowCompleted bool
+		testResult          converter.EncodedValue
+		testError           error
+		doneChannel         chan struct{}
+		workerOptions       WorkerOptions
+		dataConverter       converter.DataConverter
+		runTimeout          time.Duration
 
 		heartbeatDetails *commonpb.Payloads
 
@@ -221,8 +222,7 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 			taskQueueSpecificActivities: make(map[string]*taskQueueSpecificActivity),
 
 			logger:            s.logger,
-			metricsScope:      s.scope,
-			tracer:            opentracing.NoopTracer{},
+			metricsHandler:    s.metricsHandler,
 			mockClock:         clock.NewMock(),
 			wallClock:         clock.New(),
 			timers:            make(map[string]*testTimerHandle),
@@ -258,6 +258,11 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 		runTimeout:        maxWorkflowTimeout,
 	}
 
+	if os.Getenv("TEMPORAL_DEBUG") != "" {
+		env.testTimeout = time.Hour * 24
+		env.workerOptions.DeadlockDetectionTimeout = unlimitedDeadlockDetectionTimeout
+	}
+
 	// move forward the mock clock to start time.
 	env.setStartTime(time.Now())
 
@@ -267,8 +272,8 @@ func newTestWorkflowEnvironmentImpl(s *WorkflowTestSuite, parentRegistry *regist
 	if env.logger == nil {
 		env.logger = ilog.NewDefaultLogger()
 	}
-	if env.metricsScope == nil {
-		env.metricsScope = tally.NoopScope
+	if env.metricsHandler == nil {
+		env.metricsHandler = metrics.NopHandler
 	}
 	env.contextPropagators = s.contextPropagators
 	env.header = s.header
@@ -333,6 +338,7 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(param
 	childEnv.workerOptions = env.workerOptions
 	childEnv.dataConverter = params.DataConverter
 	childEnv.registry = env.registry
+	childEnv.detachedChildWaitDisabled = env.detachedChildWaitDisabled
 
 	if params.TaskQueueName == "" {
 		return nil, serviceerror.NewWorkflowExecutionAlreadyStarted("Empty task queue name", "", "")
@@ -380,7 +386,7 @@ func (env *testWorkflowEnvironmentImpl) newTestWorkflowEnvironmentForChild(param
 
 func (env *testWorkflowEnvironmentImpl) setWorkerOptions(options WorkerOptions) {
 	env.workerOptions = options
-	env.registry.SetWorkflowInterceptors(options.WorkflowInterceptorChainFactories)
+	env.registry.interceptors = options.Interceptors
 	if env.workerOptions.EnableSessionWorker && env.sessionEnvironment == nil {
 		env.registry.RegisterActivityWithOptions(sessionCreationActivity, RegisterActivityOptions{
 			Name:                          sessionCreationActivityName,
@@ -405,12 +411,12 @@ func (env *testWorkflowEnvironmentImpl) setContextPropagators(contextPropagators
 	env.contextPropagators = contextPropagators
 }
 
-func (env *testWorkflowEnvironmentImpl) setTracer(tracer opentracing.Tracer) {
-	env.tracer = tracer
-}
-
 func (env *testWorkflowEnvironmentImpl) setWorkerStopChannel(c chan struct{}) {
 	env.workerStopChannel = c
+}
+
+func (env *testWorkflowEnvironmentImpl) setDetachedChildWaitDisabled(detachedChildWaitDisabled bool) {
+	env.detachedChildWaitDisabled = detachedChildWaitDisabled
 }
 
 func (env *testWorkflowEnvironmentImpl) setActivityTaskQueue(taskqueue string, activityFns ...interface{}) {
@@ -485,7 +491,7 @@ func (env *testWorkflowEnvironmentImpl) executeWorkflowInternal(delayStart time.
 	if env.runTimeout > 0 {
 		timeoutDuration := env.runTimeout + delayStart
 		env.registerDelayedCallback(func() {
-			if !env.isTestCompleted {
+			if !env.isWorkflowCompleted {
 				env.Complete(nil, ErrDeadlineExceeded)
 			}
 		}, timeoutDuration)
@@ -500,7 +506,7 @@ func (env *testWorkflowEnvironmentImpl) getWorkflowDefinition(wt WorkflowType) (
 		return nil, fmt.Errorf("unable to find workflow type: %v. Supported types: [%v]", wt.Name, supported)
 	}
 	wd := &workflowExecutorWrapper{
-		workflowExecutor: &workflowExecutor{workflowType: wt.Name, fn: wf, interceptors: env.registry.WorkflowInterceptors()},
+		workflowExecutor: &workflowExecutor{workflowType: wt.Name, fn: wf, interceptors: env.registry.interceptors},
 		env:              env,
 	}
 	return newSyncWorkflowDefinition(wd), nil
@@ -611,10 +617,10 @@ func (env *testWorkflowEnvironmentImpl) executeLocalActivity(
 		attempt: 1,
 	}
 	taskHandler := localActivityTaskHandler{
-		userContext:  env.workerOptions.BackgroundActivityContext,
-		metricsScope: env.metricsScope,
-		logger:       env.logger,
-		tracer:       opentracing.NoopTracer{},
+		userContext:    env.workerOptions.BackgroundActivityContext,
+		metricsHandler: env.metricsHandler,
+		logger:         env.logger,
+		interceptors:   env.registry.interceptors,
 	}
 
 	result := taskHandler.executeLocalActivityTask(task)
@@ -626,8 +632,8 @@ func (env *testWorkflowEnvironmentImpl) executeLocalActivity(
 }
 
 func (env *testWorkflowEnvironmentImpl) startWorkflowTask() {
-	if !env.isTestCompleted {
-		env.workflowDef.OnWorkflowTaskStarted()
+	if !env.isWorkflowCompleted {
+		env.workflowDef.OnWorkflowTaskStarted(env.workerOptions.DeadlockDetectionTimeout)
 	}
 }
 
@@ -642,7 +648,10 @@ func (env *testWorkflowEnvironmentImpl) startMainLoop() {
 		return
 	}
 
-	for !env.isTestCompleted {
+	// notify all child workflows to exit their main loop
+	defer close(env.doneChannel)
+
+	for !env.shouldStopEventLoop() {
 		// use non-blocking-select to check if there is anything pending in the main thread.
 		select {
 		case c := <-env.callbackChannel:
@@ -651,7 +660,7 @@ func (env *testWorkflowEnvironmentImpl) startMainLoop() {
 		default:
 			// nothing to process, main thread is blocked at this moment, now check if we should auto fire next timer
 			if !env.autoFireNextTimer() {
-				if env.isTestCompleted {
+				if env.shouldStopEventLoop() {
 					return
 				}
 
@@ -669,6 +678,25 @@ func (env *testWorkflowEnvironmentImpl) startMainLoop() {
 			}
 		}
 	}
+}
+
+func (env *testWorkflowEnvironmentImpl) shouldStopEventLoop() bool {
+	// Check if any detached children are still running if not disabled.
+	if !env.detachedChildWaitDisabled {
+		for _, handle := range env.runningWorkflows {
+			if env.workflowInfo.WorkflowExecution.ID == handle.env.workflowInfo.WorkflowExecution.ID {
+				// ignore root workflow
+				continue
+			}
+
+			if !handle.handled && (handle.params.ParentClosePolicy == enumspb.PARENT_CLOSE_POLICY_ABANDON ||
+				handle.params.ParentClosePolicy == enumspb.PARENT_CLOSE_POLICY_REQUEST_CANCEL) {
+				return false
+			}
+		}
+	}
+
+	return env.isWorkflowCompleted
 }
 
 func (env *testWorkflowEnvironmentImpl) registerDelayedCallback(f func(), delayDuration time.Duration) {
@@ -806,17 +834,18 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelTimer(timerID TimerID) {
 }
 
 func (env *testWorkflowEnvironmentImpl) Complete(result *commonpb.Payloads, err error) {
-	if env.isTestCompleted {
+	if env.isWorkflowCompleted {
 		env.logger.Debug("Workflow already completed.")
 		return
 	}
+	env.workflowDef.Close()
 	var canceledErr *CanceledError
 	if errors.As(err, &canceledErr) && env.workflowCancelHandler != nil {
 		env.workflowCancelHandler()
 	}
 
 	dc := env.GetDataConverter()
-	env.isTestCompleted = true
+	env.isWorkflowCompleted = true
 
 	if err != nil {
 		var continueAsNewErr *ContinueAsNewError
@@ -843,8 +872,6 @@ func (env *testWorkflowEnvironmentImpl) Complete(result *commonpb.Payloads, err 
 	} else {
 		env.testResult = newEncodedValue(result, dc)
 	}
-
-	close(env.doneChannel)
 
 	if env.isChildWorkflow() {
 		// this is completion of child workflow
@@ -879,6 +906,26 @@ func (env *testWorkflowEnvironmentImpl) Complete(result *commonpb.Payloads, err 
 					env.onChildWorkflowCompletedListener(env.workflowInfo, env.testResult, childWorkflowHandle.err)
 				}
 			}, true /* true to trigger parent workflow to resume to handle child workflow's result */)
+		}
+	}
+
+	// properly handle child workflows based on their ParentClosePolicy
+	env.handleParentClosePolicy()
+}
+
+func (env *testWorkflowEnvironmentImpl) handleParentClosePolicy() {
+	for _, handle := range env.runningWorkflows {
+		if handle.env.parentEnv != nil &&
+			env.workflowInfo.WorkflowExecution.ID == handle.env.parentEnv.workflowInfo.WorkflowExecution.ID {
+
+			switch handle.params.ParentClosePolicy {
+			case enumspb.PARENT_CLOSE_POLICY_ABANDON:
+				// noop
+			case enumspb.PARENT_CLOSE_POLICY_TERMINATE:
+				handle.env.Complete(nil, newTerminatedError())
+			case enumspb.PARENT_CLOSE_POLICY_REQUEST_CANCEL:
+				handle.env.cancelWorkflow(func(result *commonpb.Payloads, err error) {})
+			}
 		}
 	}
 }
@@ -972,8 +1019,8 @@ func (env *testWorkflowEnvironmentImpl) GetLogger() log.Logger {
 	return env.logger
 }
 
-func (env *testWorkflowEnvironmentImpl) GetMetricsScope() tally.Scope {
-	return env.metricsScope
+func (env *testWorkflowEnvironmentImpl) GetMetricsHandler() metrics.Handler {
+	return env.metricsHandler
 }
 
 func (env *testWorkflowEnvironmentImpl) GetDataConverter() converter.DataConverter {
@@ -985,8 +1032,8 @@ func (env *testWorkflowEnvironmentImpl) GetContextPropagators() []ContextPropaga
 }
 
 func (env *testWorkflowEnvironmentImpl) ExecuteActivity(parameters ExecuteActivityParams, callback ResultHandler) ActivityID {
+	ensureDefaultRetryPolicy(&parameters)
 	scheduleTaskAttr := &commandpb.ScheduleActivityTaskCommandAttributes{}
-
 	scheduleID := env.nextID()
 	if parameters.ActivityID == "" {
 		scheduleTaskAttr.ActivityId = getStringID(scheduleID)
@@ -1055,13 +1102,6 @@ func (env *testWorkflowEnvironmentImpl) validateActivityScheduleAttributes(
 	attributes *commandpb.ScheduleActivityTaskCommandAttributes,
 	runTimeout time.Duration,
 ) error {
-
-	// if err := v.validateCrossNamespaceCall(
-	//	namespaceID,
-	//	targetNamespaceID,
-	// ); err != nil {
-	//	return err
-	// }
 
 	if attributes == nil {
 		return serviceerror.NewInvalidArgument("ScheduleActivityTaskCommandAttributes is not set on command.")
@@ -1182,20 +1222,26 @@ func (env *testWorkflowEnvironmentImpl) validateRetryPolicy(policy *commonpb.Ret
 		// nil policy is valid which means no retry
 		return nil
 	}
+
+	if policy.GetMaximumAttempts() == 1 {
+		// One maximum attempt effectively disable retries. Validating the
+		// rest of the arguments is pointless
+		return nil
+	}
 	if common.DurationValue(policy.GetInitialInterval()) < 0 {
-		return serviceerror.NewInvalidArgument("InitialIntervalInSeconds cannot be less than 0 on retry policy.")
+		return serviceerror.NewInvalidArgument("InitialInterval cannot be negative on retry policy.")
 	}
 	if policy.GetBackoffCoefficient() < 1 {
 		return serviceerror.NewInvalidArgument("BackoffCoefficient cannot be less than 1 on retry policy.")
 	}
 	if common.DurationValue(policy.GetMaximumInterval()) < 0 {
-		return serviceerror.NewInvalidArgument("MaximumIntervalInSeconds cannot be less than 0 on retry policy.")
+		return serviceerror.NewInvalidArgument("MaximumInterval cannot be negative on retry policy.")
 	}
 	if common.DurationValue(policy.GetMaximumInterval()) > 0 && common.DurationValue(policy.GetMaximumInterval()) < common.DurationValue(policy.GetInitialInterval()) {
-		return serviceerror.NewInvalidArgument("MaximumIntervalInSeconds cannot be less than InitialIntervalInSeconds on retry policy.")
+		return serviceerror.NewInvalidArgument("MaximumInterval cannot be less than InitialInterval on retry policy.")
 	}
 	if policy.GetMaximumAttempts() < 0 {
-		return serviceerror.NewInvalidArgument("MaximumAttempts cannot be less than 0 on retry policy.")
+		return serviceerror.NewInvalidArgument("MaximumAttempts cannot be negative on retry policy.")
 	}
 	return nil
 }
@@ -1291,6 +1337,30 @@ func getRetryBackoffFromProtoRetryPolicy(prp *commonpb.RetryPolicy, attempt int3
 	return getRetryBackoffWithNowTime(p, attempt, err, now, expireTime)
 }
 
+func ensureDefaultRetryPolicy(parameters *ExecuteActivityParams) {
+	// ensure default retry policy
+	if parameters.RetryPolicy == nil {
+		parameters.RetryPolicy = &commonpb.RetryPolicy{}
+	}
+
+	if parameters.RetryPolicy.InitialInterval == nil || *parameters.RetryPolicy.InitialInterval == 0 {
+		parameters.RetryPolicy.InitialInterval = common.DurationPtr(time.Second)
+	}
+	if parameters.RetryPolicy.MaximumInterval == nil || *parameters.RetryPolicy.MaximumInterval == 0 {
+		parameters.RetryPolicy.MaximumInterval = common.DurationPtr(*parameters.RetryPolicy.InitialInterval)
+	}
+	if parameters.RetryPolicy.BackoffCoefficient == 0 {
+		parameters.RetryPolicy.BackoffCoefficient = 2
+	}
+
+	// NOTE: the default MaximumAttempts for retry policy set by server is 0 which means unlimited retries.
+	// However, unlimited retry with automatic fast forward clock in test framework will cause the CPU to spin and test
+	// to go forever. So we need to set a reasonable default max attempts for unit test.
+	if parameters.RetryPolicy.MaximumAttempts == 0 {
+		parameters.RetryPolicy.MaximumAttempts = defaultMaximumAttemptsForUnitTest
+	}
+}
+
 func (env *testWorkflowEnvironmentImpl) ExecuteLocalActivity(params ExecuteLocalActivityParams, callback LocalActivityResultHandler) LocalActivityID {
 	activityID := getStringID(env.nextID())
 	ae := &activityExecutor{name: getActivityFunctionName(env.registry, params.ActivityFn), fn: params.ActivityFn}
@@ -1298,6 +1368,10 @@ func (env *testWorkflowEnvironmentImpl) ExecuteLocalActivity(params ExecuteLocal
 		// local activity could be registered, if so use the registered name. This name is only used to find a mock.
 		ae.name = at.Name
 	}
+	// We have to skip the interceptors on the first call because
+	// ExecuteWithActualArgs is actually invoked twice to support a mock activity
+	// function result
+	ae.skipInterceptors = true
 	aew := &activityExecutorWrapper{activityExecutor: ae, env: env}
 
 	// substitute the local activity function so we could replace with mock if it is supplied.
@@ -1308,11 +1382,11 @@ func (env *testWorkflowEnvironmentImpl) ExecuteLocalActivity(params ExecuteLocal
 	task := newLocalActivityTask(params, callback, activityID)
 	taskHandler := localActivityTaskHandler{
 		userContext:        env.workerOptions.BackgroundActivityContext,
-		metricsScope:       env.metricsScope,
+		metricsHandler:     env.metricsHandler,
 		logger:             env.logger,
 		dataConverter:      env.dataConverter,
-		tracer:             env.tracer,
 		contextPropagators: env.contextPropagators,
+		interceptors:       env.registry.interceptors,
 	}
 
 	env.localActivities[activityID] = task
@@ -1539,7 +1613,12 @@ func (a *activityExecutorWrapper) ExecuteWithActualArgs(ctx context.Context, inp
 
 	m := &mockWrapper{env: a.env, name: a.name, fn: a.fn, isWorkflow: false}
 	if mockRet := m.getMockReturnWithActualArgs(ctx, inputArgs); mockRet != nil {
-		return m.executeMockWithActualArgs(ctx, inputArgs, mockRet)
+		// check if mock returns function which must match to the actual function.
+		if mockFn := m.getMockFn(mockRet); mockFn != nil {
+			executor := &activityExecutor{name: m.name, fn: mockFn}
+			return executor.ExecuteWithActualArgs(ctx, inputArgs)
+		}
+		return m.getMockValue(mockRet)
 	}
 
 	return a.activityExecutor.ExecuteWithActualArgs(ctx, inputArgs)
@@ -1559,14 +1638,16 @@ func (w *workflowExecutorWrapper) Execute(ctx Context, input *commonpb.Payloads)
 		env.runningCount++
 	}
 
-	m := &mockWrapper{env: env, name: w.workflowType, fn: w.fn, isWorkflow: true,
-		dataConverter: env.GetDataConverter(), interceptors: env.GetRegistry().WorkflowInterceptors()}
+	m := &mockWrapper{env: env, name: w.workflowType, fn: w.fn, isWorkflow: true, dataConverter: env.GetDataConverter()}
 	// This method is called by workflow's dispatcher. In this test suite, it is run in the main loop. We cannot block
 	// the main loop, but the mock could block if it is configured to wait. So we need to use a separate goroutinue to
 	// run the mock, and resume after mock call returns.
 	mockReadyChannel := NewChannel(ctx)
 	// make a copy of the context for getMockReturn() call to avoid race condition
-	ctxCopy := newWorkflowContext(w.env, nil, nil)
+	_, ctxCopy, err := newWorkflowContext(w.env, nil)
+	if err != nil {
+		return nil, err
+	}
 	go func() {
 		// getMockReturn could block if mock is configured to wait. The returned mockRet is what has been configured
 		// for the mock by using MockCallWrapper.Return(). The mockRet could be mock values or mock function. We process
@@ -1665,7 +1746,7 @@ func (m *mockWrapper) getMockFn(mockRet mock.Arguments) interface{} {
 	mockFnType := reflect.TypeOf(mockFn)
 	if mockFnType != nil && mockFnType.Kind() == reflect.Func {
 		if mockFnType != fnType {
-			fnName := getFunctionName(m.fn)
+			fnName, _ := getFunctionName(m.fn)
 			// mockDummyActivity is used to register mocks by name
 			if fnName != "mockDummyActivity" {
 				panic(fmt.Sprintf("mock of %v has incorrect return function, expected %v, but actual is %v",
@@ -1755,29 +1836,17 @@ func (m *mockWrapper) executeMock(ctx interface{}, input *commonpb.Payloads, moc
 	return m.getMockValue(mockRet)
 }
 
-func (m *mockWrapper) executeMockWithActualArgs(ctx interface{}, inputArgs []interface{}, mockRet mock.Arguments) (*commonpb.Payloads, error) {
-	fnName := m.name
-	// check if mock returns function which must match to the actual function.
-	if mockFn := m.getMockFn(mockRet); mockFn != nil {
-		executor := &activityExecutor{name: fnName, fn: mockFn}
-		return executor.ExecuteWithActualArgs(ctx.(context.Context), inputArgs)
-	}
-
-	return m.getMockValue(mockRet)
-}
-
 func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskQueue string, dataConverter converter.DataConverter) ActivityTaskHandler {
 	setWorkerOptionsDefaults(&env.workerOptions)
 	params := workerExecutionParameters{
 		TaskQueue:          taskQueue,
 		Identity:           env.identity,
-		MetricsScope:       env.metricsScope,
+		MetricsHandler:     env.metricsHandler,
 		Logger:             env.logger,
 		UserContext:        env.workerOptions.BackgroundActivityContext,
 		DataConverter:      dataConverter,
 		WorkerStopChannel:  env.workerStopChannel,
 		ContextPropagators: env.contextPropagators,
-		Tracer:             env.tracer,
 	}
 	ensureRequiredParams(&params)
 	if params.UserContext == nil {
@@ -1913,11 +1982,15 @@ func (env *testWorkflowEnvironmentImpl) RegisterCancelHandler(handler func()) {
 	env.workflowCancelHandler = handler
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterSignalHandler(handler func(name string, input *commonpb.Payloads)) {
+func (env *testWorkflowEnvironmentImpl) RegisterSignalHandler(
+	handler func(name string, input *commonpb.Payloads, header *commonpb.Header) error,
+) {
 	env.signalHandler = handler
 }
 
-func (env *testWorkflowEnvironmentImpl) RegisterQueryHandler(handler func(string, *commonpb.Payloads) (*commonpb.Payloads, error)) {
+func (env *testWorkflowEnvironmentImpl) RegisterQueryHandler(
+	handler func(string, *commonpb.Payloads, *commonpb.Header) (*commonpb.Payloads, error),
+) {
 	env.queryHandler = handler
 }
 
@@ -1965,8 +2038,7 @@ func (env *testWorkflowEnvironmentImpl) RequestCancelExternalWorkflow(namespace,
 		m := &mockWrapper{name: mockMethodForRequestCancelExternalWorkflow, fn: mockFnRequestCancelExternalWorkflow}
 		var err error
 		if mockFn := m.getMockFn(mockRet); mockFn != nil {
-			executor := &activityExecutor{name: mockMethodForRequestCancelExternalWorkflow, fn: mockFn}
-			_, err = executor.ExecuteWithActualArgs(context.TODO(), args)
+			_, err = executeFunctionWithContext(context.TODO(), mockFn, args)
 		} else {
 			_, err = m.getMockValue(mockRet)
 		}
@@ -1982,18 +2054,28 @@ func (env *testWorkflowEnvironmentImpl) IsReplaying() bool {
 	return false
 }
 
-func (env *testWorkflowEnvironmentImpl) SignalExternalWorkflow(namespace, workflowID, runID, signalName string, input *commonpb.Payloads, arg interface{}, childWorkflowOnly bool, callback ResultHandler) {
+func (env *testWorkflowEnvironmentImpl) SignalExternalWorkflow(
+	namespace string,
+	workflowID string,
+	runID string,
+	signalName string,
+	input *commonpb.Payloads,
+	arg interface{},
+	header *commonpb.Header,
+	childWorkflowOnly bool,
+	callback ResultHandler,
+) {
 	// check if target workflow is a known workflow
 	if childHandle, ok := env.runningWorkflows[workflowID]; ok {
 		// target workflow is a child
 		childEnv := childHandle.env
-		if childEnv.isTestCompleted {
+		if childEnv.isWorkflowCompleted {
 			// child already completed (NOTE: we have only one failed cause now)
 			err := newUnknownExternalWorkflowExecutionError()
 			callback(nil, err)
 		} else {
-			childEnv.signalHandler(signalName, input)
-			callback(nil, nil)
+			err := childEnv.signalHandler(signalName, input, header)
+			callback(nil, err)
 		}
 		childEnv.postCallback(func() {}, true) // resume child workflow since a signal is sent.
 		return
@@ -2017,8 +2099,7 @@ func (env *testWorkflowEnvironmentImpl) SignalExternalWorkflow(namespace, workfl
 		m := &mockWrapper{name: mockMethodForSignalExternalWorkflow, fn: mockFnSignalExternalWorkflow}
 		var err error
 		if mockFn := m.getMockFn(mockRet); mockFn != nil {
-			executor := &activityExecutor{name: mockMethodForSignalExternalWorkflow, fn: mockFn}
-			_, err = executor.ExecuteWithActualArgs(context.TODO(), args)
+			_, err = executeFunctionWithContext(context.TODO(), mockFn, args)
 		} else {
 			_, err = m.getMockValue(mockRet)
 		}
@@ -2087,10 +2168,17 @@ func (env *testWorkflowEnvironmentImpl) getMockedVersion(mockedChangeID, changeI
 	args := []interface{}{changeID, minSupported, maxSupported}
 	// below call will panic if mock is not properly setup.
 	mockRet := env.mock.MethodCalled(mockMethod, args...)
-	m := &mockWrapper{name: mockMethodForGetVersion, fn: mockFnGetVersion, interceptors: env.registry.WorkflowInterceptors()}
+	m := &mockWrapper{name: mockMethodForGetVersion, fn: mockFnGetVersion}
 	if mockFn := m.getMockFn(mockRet); mockFn != nil {
-		executor := &activityExecutor{name: mockMethodForGetVersion, fn: mockFn}
-		reflectValues := executor.executeWithActualArgsWithoutParseResult(context.TODO(), args)
+		var reflectArgs []reflect.Value
+		// Add context if first param
+		if fnType := reflect.TypeOf(mockFn); fnType.NumIn() > 0 && isActivityContext(fnType.In(0)) {
+			reflectArgs = append(reflectArgs, reflect.ValueOf(context.TODO()))
+		}
+		for _, arg := range args {
+			reflectArgs = append(reflectArgs, reflect.ValueOf(arg))
+		}
+		reflectValues := reflect.ValueOf(mockFn).Call(reflectArgs)
 		if len(reflectValues) != 1 || !reflect.TypeOf(reflectValues[0].Interface()).AssignableTo(reflect.TypeOf(DefaultVersion)) {
 			panic(fmt.Sprintf("mock of GetVersion has incorrect return type, expected workflow.Version, but actual is %T (%v)",
 				reflectValues[0].Interface(), reflectValues[0].Interface()))
@@ -2180,7 +2268,8 @@ func (env *testWorkflowEnvironmentImpl) signalWorkflow(name string, input interf
 		panic(err)
 	}
 	env.postCallback(func() {
-		env.signalHandler(name, data)
+		// Do not send any headers on test invocations
+		_ = env.signalHandler(name, data, nil)
 	}, startWorkflowTask)
 }
 
@@ -2195,7 +2284,8 @@ func (env *testWorkflowEnvironmentImpl) signalWorkflowByID(workflowID, signalNam
 			return serviceerror.NewNotFound(fmt.Sprintf("Workflow %v already completed", workflowID))
 		}
 		workflowHandle.env.postCallback(func() {
-			workflowHandle.env.signalHandler(signalName, data)
+			// Do not send any headers on test invocations
+			_ = workflowHandle.env.signalHandler(signalName, data, nil)
 		}, true)
 		return nil
 	}
@@ -2208,7 +2298,8 @@ func (env *testWorkflowEnvironmentImpl) queryWorkflow(queryType string, args ...
 	if err != nil {
 		return nil, err
 	}
-	blob, err := env.queryHandler(queryType, data)
+	// Do not send any headers on test invocations
+	blob, err := env.queryHandler(queryType, data, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2221,7 +2312,8 @@ func (env *testWorkflowEnvironmentImpl) queryWorkflowByID(workflowID, queryType 
 		if err != nil {
 			return nil, err
 		}
-		blob, err := workflowHandle.env.queryHandler(queryType, data)
+		// Do not send any headers on test invocations
+		blob, err := workflowHandle.env.queryHandler(queryType, data, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -2274,6 +2366,9 @@ func (env *testWorkflowEnvironmentImpl) setStartWorkflowOptions(options StartWor
 	}
 	if options.WorkflowTaskTimeout > 0 {
 		wf.WorkflowTaskTimeout = options.WorkflowTaskTimeout
+	}
+	if len(options.ID) > 0 {
+		wf.WorkflowExecution.ID = options.ID
 	}
 	if len(options.TaskQueue) > 0 {
 		wf.TaskQueueName = options.TaskQueue

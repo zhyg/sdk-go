@@ -191,12 +191,12 @@ const (
 	localActivityMarkerName     = "LocalActivity"
 	mutableSideEffectMarkerName = "MutableSideEffect"
 
-	sideEffectMarkerIDName               = "side-effect-id"
-	sideEffectMarkerDataName             = "data"
-	versionMarkerChangeIDName            = "change-id"
-	versionMarkerDataName                = "version"
-	localActivityMarkerDataDetailsName   = "data"
-	localActivityMarkerResultDetailsName = "result"
+	sideEffectMarkerIDName      = "side-effect-id"
+	sideEffectMarkerDataName    = "data"
+	versionMarkerChangeIDName   = "change-id"
+	versionMarkerDataName       = "version"
+	localActivityMarkerDataName = "data"
+	localActivityResultName     = "result"
 )
 
 func (d commandState) String() string {
@@ -652,7 +652,16 @@ func (d *childWorkflowCommandStateMachine) handleCancelFailedEvent() {
 func (d *childWorkflowCommandStateMachine) cancel() {
 	switch d.state {
 	case commandStateStarted:
+		if d.helper.workflowExecutionIsCancelling {
+			d.helper.commandsCancelledDuringWFCancellation++
+		}
 		d.moveState(commandStateCanceledAfterStarted, eventCancel)
+		// A child workflow may be canceled _after_ something like an activity start
+		// happens inside a simulated goroutine. However, since the state of the
+		// entire child workflow is recorded based on when it started not when it
+		// was canceled, we have to move it to the end once canceled to keep the
+		// expected commands in order of when they actually occurred.
+		d.helper.moveCommandToBack(d)
 		d.helper.incrementNextCommandEventID()
 	default:
 		d.commandStateMachineBase.cancel()
@@ -827,13 +836,15 @@ func (h *commandsHelper) getNextID() int64 {
 }
 
 func (h *commandsHelper) incrementNextCommandEventIDIfVersionMarker() {
-	if _, ok := h.versionMarkerLookup[h.nextCommandEventID]; ok {
+	_, ok := h.versionMarkerLookup[h.nextCommandEventID]
+	for ok {
 		// Remove the marker from the lookup map and increment nextCommandEventID by 2 because call to GetVersion
 		// results in 2 events in the history.  One is GetVersion marker event for changeID and change version, other
 		// is UpsertSearchableAttributes to keep track of executions using particular version of code.
 		delete(h.versionMarkerLookup, h.nextCommandEventID)
 		h.incrementNextCommandEventID()
 		h.incrementNextCommandEventID()
+		_, ok = h.versionMarkerLookup[h.nextCommandEventID]
 	}
 }
 
@@ -858,6 +869,32 @@ func (h *commandsHelper) addCommand(command commandStateMachine) {
 	// Every time new command is added increment the counter used for generating ID
 	h.incrementNextCommandEventIDIfVersionMarker()
 	h.incrementNextCommandEventID()
+}
+
+// This really should not exist, but is unavoidable without totally redesigning the Go SDK to avoid
+// doing event number counting. EX: Because a workflow execution cancel requested event calls a callback
+// on timers that immediately cancels them, we will queue up a cancel timer command even though that timer firing
+// might be in the same workflow task. In practice this only seems to happen during unhandled command events.
+func (h *commandsHelper) removeCancelOfResolvedCommand(commandID commandID) {
+	// Ensure this isn't misused for non-cancel commands
+	if commandID.commandType != commandTypeCancelTimer {
+		panic("removeCancelOfResolvedCommand should only be called for cancel timer")
+	}
+	orderedCmdEl, ok := h.commands[commandID]
+	if ok {
+		delete(h.commands, commandID)
+		h.orderedCommands.Remove(orderedCmdEl)
+		h.commandsCancelledDuringWFCancellation--
+	}
+}
+
+func (h *commandsHelper) moveCommandToBack(command commandStateMachine) {
+	elem := h.commands[command.getID()]
+	if elem == nil {
+		panicIllegalState(fmt.Sprintf("moving command not present %v", command))
+	}
+	h.orderedCommands.Remove(elem)
+	h.commands[command.getID()] = h.orderedCommands.PushBack(command)
 }
 
 func (h *commandsHelper) scheduleActivityTask(
@@ -1134,7 +1171,16 @@ func (h *commandsHelper) handleRequestCancelExternalWorkflowExecutionFailed(init
 	return isExternal, command
 }
 
-func (h *commandsHelper) signalExternalWorkflowExecution(namespace, workflowID, runID, signalName string, input *commonpb.Payloads, signalID string, childWorkflowOnly bool) commandStateMachine {
+func (h *commandsHelper) signalExternalWorkflowExecution(
+	namespace string,
+	workflowID string,
+	runID string,
+	signalName string,
+	input *commonpb.Payloads,
+	header *commonpb.Header,
+	signalID string,
+	childWorkflowOnly bool,
+) commandStateMachine {
 	attributes := &commandpb.SignalExternalWorkflowExecutionCommandAttributes{
 		Namespace: namespace,
 		Execution: &commonpb.WorkflowExecution{
@@ -1145,6 +1191,7 @@ func (h *commandsHelper) signalExternalWorkflowExecution(namespace, workflowID, 
 		Input:             input,
 		Control:           signalID,
 		ChildWorkflowOnly: childWorkflowOnly,
+		Header:            header,
 	}
 	command := h.newSignalExternalWorkflowStateMachine(attributes, signalID)
 	h.addCommand(command)
@@ -1201,6 +1248,10 @@ func (h *commandsHelper) cancelTimer(timerID TimerID) commandStateMachine {
 
 func (h *commandsHelper) handleTimerClosed(timerID string) commandStateMachine {
 	command := h.getCommand(makeCommandID(commandTypeTimer, timerID))
+	// If, for whatever reason, we were going to send a timer cancel command, don't do that anymore
+	// since we already know the timer is resolved.
+	possibleCancelID := makeCommandID(commandTypeCancelTimer, timerID)
+	h.removeCancelOfResolvedCommand(possibleCancelID)
 	command.handleCompletionEvent()
 	return command
 }

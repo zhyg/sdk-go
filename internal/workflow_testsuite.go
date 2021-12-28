@@ -31,13 +31,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/mock"
-	"github.com/uber-go/tally"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/internal/common/metrics"
 	"go.temporal.io/sdk/log"
 )
 
@@ -54,7 +54,7 @@ type (
 	// WorkflowTestSuite is the test suite to run unit tests for workflow/activity.
 	WorkflowTestSuite struct {
 		logger             log.Logger
-		scope              tally.Scope
+		metricsHandler     metrics.Handler
 		contextPropagators []ContextPropagator
 		header             *commonpb.Header
 	}
@@ -142,10 +142,10 @@ func (s *WorkflowTestSuite) GetLogger() log.Logger {
 	return s.logger
 }
 
-// SetMetricsScope sets the metrics scope for this WorkflowTestSuite. If you don't set scope, test suite will use
-// tally.NoopScope
-func (s *WorkflowTestSuite) SetMetricsScope(scope tally.Scope) {
-	s.scope = scope
+// SetMetricsHandler sets the metrics handler for this WorkflowTestSuite. If you don't set handler, test suite will use
+// a noop handler.
+func (s *WorkflowTestSuite) SetMetricsHandler(metricsHandler metrics.Handler) {
+	s.metricsHandler = metricsHandler
 }
 
 // SetContextPropagators sets the context propagators for this WorkflowTestSuite. If you don't set context propagators,
@@ -200,12 +200,6 @@ func (t *TestActivityEnvironment) SetDataConverter(dataConverter converter.DataC
 // SetIdentity sets identity.
 func (t *TestActivityEnvironment) SetIdentity(identity string) *TestActivityEnvironment {
 	t.impl.setIdentity(identity)
-	return t
-}
-
-// SetTracer sets tracer.
-func (t *TestActivityEnvironment) SetTracer(tracer opentracing.Tracer) *TestActivityEnvironment {
-	t.impl.setTracer(tracer)
 	return t
 }
 
@@ -449,6 +443,20 @@ func (c *MockCallWrapper) Times(i int) *MockCallWrapper {
 	return c
 }
 
+// Never indicates that the mock should not be called.
+func (c *MockCallWrapper) Never() *MockCallWrapper {
+	c.call.Maybe()
+	c.call.Panic(fmt.Sprintf("unexpected call: %s(%s)", c.call.Method, c.call.Arguments.String()))
+	return c
+}
+
+// Maybe indicates that the mock call is optional. Not calling an optional method
+// will not cause an error while asserting expectations.
+func (c *MockCallWrapper) Maybe() *MockCallWrapper {
+	c.call.Maybe()
+	return c
+}
+
 // Run sets a handler to be called before returning. It can be used when mocking a method such as unmarshalers that
 // takes a pointer to a struct and sets properties in such struct.
 func (c *MockCallWrapper) Run(fn func(args mock.Arguments)) *MockCallWrapper {
@@ -531,9 +539,16 @@ func (e *TestWorkflowEnvironment) SetIdentity(identity string) *TestWorkflowEnvi
 	return e
 }
 
-// SetTracer sets tracer.
-func (e *TestWorkflowEnvironment) SetTracer(tracer opentracing.Tracer) *TestWorkflowEnvironment {
-	e.impl.setTracer(tracer)
+// SetDetachedChildWait, if true, will make ExecuteWorkflow wait on all child
+// workflows to complete even if their close policy is set to abandon or request
+// cancel, meaning they are "detached". If false, ExecuteWorkflow will block
+// until only all attached child workflows have completed. This is useful when
+// testing endless detached child workflows, as without it ExecuteWorkflow may
+// not return while detached children are still running.
+//
+// Default is true.
+func (e *TestWorkflowEnvironment) SetDetachedChildWait(detachedChildWait bool) *TestWorkflowEnvironment {
+	e.impl.setDetachedChildWaitDisabled(!detachedChildWait)
 	return e
 }
 
@@ -663,12 +678,12 @@ func (e *TestWorkflowEnvironment) SetOnLocalActivityCanceledListener(
 
 // IsWorkflowCompleted check if test is completed or not
 func (e *TestWorkflowEnvironment) IsWorkflowCompleted() bool {
-	return e.impl.isTestCompleted
+	return e.impl.isWorkflowCompleted
 }
 
 // GetWorkflowResult extracts the encoded result from test workflow, it returns error if the extraction failed.
 func (e *TestWorkflowEnvironment) GetWorkflowResult(valuePtr interface{}) error {
-	if !e.impl.isTestCompleted {
+	if !e.impl.isWorkflowCompleted {
 		panic("workflow is not completed")
 	}
 	if e.impl.testError != nil || e.impl.testResult == nil || valuePtr == nil {
@@ -677,9 +692,31 @@ func (e *TestWorkflowEnvironment) GetWorkflowResult(valuePtr interface{}) error 
 	return e.impl.testResult.Get(valuePtr)
 }
 
+// GetWorkflowResultByID extracts the encoded result from workflow by ID, it returns error if the extraction failed.
+func (e *TestWorkflowEnvironment) GetWorkflowResultByID(workflowID string, valuePtr interface{}) error {
+	if workflowHandle, ok := e.impl.runningWorkflows[workflowID]; ok {
+		if !workflowHandle.env.isWorkflowCompleted {
+			panic("workflow is not completed")
+		}
+		if workflowHandle.env.testError != nil || workflowHandle.env.testResult == nil || valuePtr == nil {
+			return e.impl.testError
+		}
+		return e.impl.testResult.Get(valuePtr)
+	}
+	return serviceerror.NewNotFound(fmt.Sprintf("Workflow %v not exists", workflowID))
+}
+
 // GetWorkflowError return the error from test workflow
 func (e *TestWorkflowEnvironment) GetWorkflowError() error {
 	return e.impl.testError
+}
+
+// GetWorkflowErrorByID return the error from test workflow
+func (e *TestWorkflowEnvironment) GetWorkflowErrorByID(workflowID string) error {
+	if workflowHandle, ok := e.impl.runningWorkflows[workflowID]; ok {
+		return workflowHandle.env.testError
+	}
+	return serviceerror.NewNotFound(fmt.Sprintf("Workflow %v not exists", workflowID))
 }
 
 // CompleteActivity complete an activity that had returned activity.ErrResultPending error
@@ -723,7 +760,9 @@ func (e *TestWorkflowEnvironment) QueryWorkflowByID(workflowID, queryType string
 // the timer fires, the callback will be called. By default, this test suite uses mock clock which automatically move
 // forward to fire next timer when workflow is blocked. Use this API to make some event (like activity completion,
 // signal or workflow cancellation) at desired time.
-// Use 0 delayDuration to send a signal to simulate SignalWithStart.
+//
+// Use 0 delayDuration to send a signal to simulate SignalWithStart. Note that a 0 duration delay will *not* work with
+// Queries, as the workflow will not have had a chance to register any query handlers.
 func (e *TestWorkflowEnvironment) RegisterDelayedCallback(callback func(), delayDuration time.Duration) {
 	e.impl.registerDelayedCallback(callback, delayDuration)
 }

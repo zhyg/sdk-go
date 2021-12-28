@@ -71,6 +71,66 @@ func (s *WorkflowUnitTest) Test_WorldWorkflow() {
 	s.NoError(env.GetWorkflowError())
 }
 
+func (s *WorkflowUnitTest) Test_WorkflowWithLocalActivityDefaultRetryPolicy() {
+	env := s.NewTestWorkflowEnvironment()
+	laOpts := LocalActivityOptions{
+		ScheduleToCloseTimeout: 5 * time.Second,
+	}
+	env.ExecuteWorkflow(workflowWithFailingLocalActivity, laOpts, 2)
+	s.True(env.IsWorkflowCompleted())
+	s.NoError(env.GetWorkflowError())
+}
+
+func (s *WorkflowUnitTest) Test_WorkflowWithLocalActivityWithMaxAttempts() {
+	env := s.NewTestWorkflowEnvironment()
+	laOpts := LocalActivityOptions{
+		ScheduleToCloseTimeout: 5 * time.Second,
+		RetryPolicy: &RetryPolicy{
+			MaximumAttempts: 3,
+		},
+	}
+	env.ExecuteWorkflow(workflowWithFailingLocalActivity, laOpts, 2)
+	s.True(env.IsWorkflowCompleted())
+	s.NoError(env.GetWorkflowError())
+}
+
+func (s *WorkflowUnitTest) Test_WorkflowWithLocalActivityWithMaxAttemptsExceeded() {
+	env := s.NewTestWorkflowEnvironment()
+	laOpts := LocalActivityOptions{
+		ScheduleToCloseTimeout: 5 * time.Second,
+		RetryPolicy: &RetryPolicy{
+			MaximumAttempts: 3,
+		},
+	}
+	env.ExecuteWorkflow(workflowWithFailingLocalActivity, laOpts, 5)
+	s.True(env.IsWorkflowCompleted())
+	s.Error(env.GetWorkflowError())
+}
+
+func workflowWithFailingLocalActivity(ctx Context, laOpts LocalActivityOptions, laTimesToFail int) error {
+	ctx = WithLocalActivityOptions(ctx, laOpts)
+	activity := &FailNTimesAct{timesToFail: laTimesToFail}
+	f := ExecuteLocalActivity(ctx, activity.run)
+	err := f.Get(ctx, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type FailNTimesAct struct {
+	timesExecuted int
+	timesToFail   int
+}
+
+func (a *FailNTimesAct) run(_ context.Context) error {
+	a.timesExecuted++
+	if a.timesExecuted <= a.timesToFail {
+		return fmt.Errorf("simulated activity failure on attempt %v", a.timesExecuted)
+	}
+	return nil
+}
+
 func helloWorldAct(ctx context.Context) (string, error) {
 	s := ctx.Value(unitTestKey).(*WorkflowUnitTest)
 	info := GetActivityInfo(ctx)
@@ -182,8 +242,8 @@ func (s *WorkflowUnitTest) Test_SplitJoinActivityWorkflow() {
 			panic(fmt.Sprintf("Unexpected activityID: %v", activityID))
 		}
 	}).Twice()
-	tracer := tracingWorkflowInterceptor{}
-	env.SetWorkerOptions(WorkerOptions{WorkflowInterceptorChainFactories: []WorkflowInterceptor{&tracer}})
+	tracer := tracingWorkerInterceptor{}
+	env.SetWorkerOptions(WorkerOptions{Interceptors: []WorkerInterceptor{&tracer}})
 	env.ExecuteWorkflow(splitJoinActivityWorkflow, false)
 	s.True(env.IsWorkflowCompleted())
 	s.NoError(env.GetWorkflowError())
@@ -506,6 +566,34 @@ func (s *WorkflowUnitTest) Test_CancelWorkflowAfterActivity() {
 	s.True(env.IsWorkflowCompleted())
 }
 
+func cancelledWorkflowStartingChildWorkflow(ctx Context) (bool, error) {
+	// schedule a timer, which will be cancelled
+	_ = Sleep(ctx, 5*time.Minute)
+
+	ctx = WithChildWorkflowOptions(ctx, ChildWorkflowOptions{
+		WorkflowExecutionTimeout: time.Second * 30,
+	})
+	childErr := ExecuteChildWorkflow(ctx, sleepWorkflow, time.Second).Get(ctx, nil)
+	if childErr != nil {
+		return false, childErr
+	}
+
+	return true, nil
+}
+
+func (s *WorkflowUnitTest) Test_CancelledWorkflowCantStartChild() {
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterWorkflow(sleepWorkflow)
+	env.RegisterDelayedCallback(func() {
+		env.CancelWorkflow()
+	}, time.Minute)
+	env.ExecuteWorkflow(cancelledWorkflowStartingChildWorkflow)
+	err := env.GetWorkflowError()
+	s.Error(err)
+	var cancelErr *CanceledError
+	s.True(errors.As(err, &cancelErr))
+}
+
 func signalWorkflowTest(ctx Context) ([]byte, error) {
 	// read multiple times.
 	var result string
@@ -677,8 +765,8 @@ func receiveAsyncCorruptSignalWorkflowTest(ctx Context) ([]message, error) {
 }
 
 func (s *WorkflowUnitTest) Test_CorruptedSignalWorkflow_ShouldLogMetricsAndNotPanic() {
-	scope, closer, reporter := metrics.NewTaggedMetricsScope()
-	s.SetMetricsScope(scope)
+	metricsHandler := metrics.NewCapturingHandler()
+	s.SetMetricsHandler(metricsHandler)
 	env := s.NewTestWorkflowEnvironment()
 
 	// Setup signals.
@@ -702,16 +790,15 @@ func (s *WorkflowUnitTest) Test_CorruptedSignalWorkflow_ShouldLogMetricsAndNotPa
 	s.EqualValues(1, len(result))
 	s.EqualValues("the right interface", result[0].Value)
 
-	_ = closer.Close()
-	counts := reporter.Counts()
-	s.EqualValues(1, len(counts))
-	s.EqualValues(metrics.CorruptedSignalsCounter, counts[0].Name())
-	s.EqualValues(1, counts[0].Value())
+	counters := metricsHandler.Counters()
+	s.EqualValues(1, len(counters))
+	s.EqualValues(metrics.CorruptedSignalsCounter, counters[0].Name)
+	s.EqualValues(1, counters[0].Value())
 }
 
 func (s *WorkflowUnitTest) Test_CorruptedSignalWorkflow_OnSelectorRead_ShouldLogMetricsAndNotPanic() {
-	scope, closer, reporter := metrics.NewTaggedMetricsScope()
-	s.SetMetricsScope(scope)
+	metricsHandler := metrics.NewCapturingHandler()
+	s.SetMetricsHandler(metricsHandler)
 	env := s.NewTestWorkflowEnvironment()
 
 	// Setup signals.
@@ -735,16 +822,15 @@ func (s *WorkflowUnitTest) Test_CorruptedSignalWorkflow_OnSelectorRead_ShouldLog
 	s.EqualValues(1, len(result))
 	s.EqualValues("the right interface", result[0].Value)
 
-	_ = closer.Close()
-	counts := reporter.Counts()
-	s.EqualValues(1, len(counts))
-	s.EqualValues(metrics.CorruptedSignalsCounter, counts[0].Name())
-	s.EqualValues(1, counts[0].Value())
+	counters := metricsHandler.Counters()
+	s.EqualValues(1, len(counters))
+	s.EqualValues(metrics.CorruptedSignalsCounter, counters[0].Name)
+	s.EqualValues(1, counters[0].Value())
 }
 
 func (s *WorkflowUnitTest) Test_CorruptedSignalWorkflow_ReceiveAsync_ShouldLogMetricsAndNotPanic() {
-	scope, closer, reporter := metrics.NewTaggedMetricsScope()
-	s.SetMetricsScope(scope)
+	metricsHandler := metrics.NewCapturingHandler()
+	s.SetMetricsHandler(metricsHandler)
 	env := s.NewTestWorkflowEnvironment()
 
 	env.ExecuteWorkflow(receiveAsyncCorruptSignalWorkflowTest)
@@ -756,11 +842,10 @@ func (s *WorkflowUnitTest) Test_CorruptedSignalWorkflow_ReceiveAsync_ShouldLogMe
 	s.EqualValues(1, len(result))
 	s.EqualValues("the right interface", result[0].Value)
 
-	_ = closer.Close()
-	counts := reporter.Counts()
-	s.EqualValues(1, len(counts))
-	s.EqualValues(metrics.CorruptedSignalsCounter, counts[0].Name())
-	s.EqualValues(2, counts[0].Value())
+	counters := metricsHandler.Counters()
+	s.EqualValues(1, len(counters))
+	s.EqualValues(metrics.CorruptedSignalsCounter, counters[0].Name)
+	s.EqualValues(2, counters[0].Value())
 }
 
 func (s *WorkflowUnitTest) Test_CorruptedSignalOnClosedChannelWorkflow_ReceiveAsync_ShouldComplete() {
@@ -1261,48 +1346,97 @@ func (s *WorkflowUnitTest) Test_WaitGroupWorkflowTest() {
 	s.Equal(n, total)
 }
 
-var _ WorkflowInterceptor = (*tracingWorkflowInterceptor)(nil)
-var _ WorkflowOutboundCallsInterceptor = (*tracingOutboundCallsInterceptor)(nil)
+func (s *WorkflowUnitTest) Test_StaleGoroutinesAreShutDown() {
+	env := s.NewTestWorkflowEnvironment()
+	deferred := make(chan struct{})
+	after := make(chan struct{})
+	wf := func(ctx Context) error {
+		Go(ctx, func(ctx Context) {
+			defer func() { close(deferred) }()
+			_ = Sleep(ctx, time.Hour) // outlive the workflow
+			close(after)
+		})
+		_ = Sleep(ctx, time.Minute)
+		return nil
+	}
+	env.RegisterWorkflow(wf)
+
+	env.ExecuteWorkflow(wf)
+	s.True(env.IsWorkflowCompleted())
+	s.NoError(env.GetWorkflowError())
+
+	// goroutines are shut down async at the moment, so wait with a timeout.
+	// give it up to 1s total.
+
+	started := time.Now()
+	maxWait := time.NewTimer(time.Second)
+	defer maxWait.Stop()
+	select {
+	case <-deferred:
+		s.T().Logf("deferred callback executed after %v", time.Since(started))
+	case <-maxWait.C:
+		s.Fail("deferred func should have been called within 1 second")
+	}
+	// if deferred code has run, this has already occurred-or-not.
+	// if it timed out waiting for the deferred code, it has waited long enough, and this is mostly a curiosity.
+	select {
+	case <-after:
+		s.Fail("code after sleep should not have run")
+	default:
+		s.T().Log("code after sleep correctly not executed")
+	}
+}
+
+var _ WorkerInterceptor = (*tracingWorkerInterceptor)(nil)
+var _ WorkflowOutboundInterceptor = (*tracingWorkflowOutboundInterceptor)(nil)
 
 type (
-	tracingWorkflowInterceptor struct {
-		instances []*tracingInboundCallsInterceptor
+	tracingWorkerInterceptor struct {
+		WorkerInterceptorBase
+		instances []*tracingWorkflowInboundInterceptor
 	}
 
-	tracingInboundCallsInterceptor struct {
-		WorkflowInboundCallsInterceptorBase
+	tracingWorkflowInboundInterceptor struct {
+		WorkflowInboundInterceptorBase
 		trace []string
 	}
 
-	tracingOutboundCallsInterceptor struct {
-		WorkflowOutboundCallsInterceptorBase
-		inbound *tracingInboundCallsInterceptor
+	tracingWorkflowOutboundInterceptor struct {
+		WorkflowOutboundInterceptorBase
+		inbound *tracingWorkflowInboundInterceptor
 	}
 )
 
-func (t *tracingWorkflowInterceptor) InterceptWorkflow(info *WorkflowInfo, next WorkflowInboundCallsInterceptor) WorkflowInboundCallsInterceptor {
-	result := &tracingInboundCallsInterceptor{
-		WorkflowInboundCallsInterceptorBase{
-			Next: next,
-		}, nil,
-	}
-	t.instances = append(t.instances, result)
-	return result
+func (t *tracingWorkerInterceptor) InterceptWorkflow(ctx Context, next WorkflowInboundInterceptor) WorkflowInboundInterceptor {
+	var result tracingWorkflowInboundInterceptor
+	result.Next = next
+	t.instances = append(t.instances, &result)
+	return &result
 }
 
-func (t *tracingInboundCallsInterceptor) Init(outbound WorkflowOutboundCallsInterceptor) error {
-	return t.Next.Init(&tracingOutboundCallsInterceptor{
-		WorkflowOutboundCallsInterceptorBase{Next: outbound}, t})
+func (t *tracingWorkflowInboundInterceptor) Init(outbound WorkflowOutboundInterceptor) error {
+	return t.Next.Init(&tracingWorkflowOutboundInterceptor{
+		WorkflowOutboundInterceptorBase{Next: outbound}, t})
 }
 
-func (t *tracingInboundCallsInterceptor) ExecuteWorkflow(ctx Context, workflowType string, args ...interface{}) []interface{} {
-	t.trace = append(t.trace, "ExecuteWorkflow "+workflowType+" begin")
-	result := t.Next.ExecuteWorkflow(ctx, workflowType, args...)
-	t.trace = append(t.trace, "ExecuteWorkflow "+workflowType+" end")
-	return result
+func (t *tracingWorkflowInboundInterceptor) ExecuteWorkflow(ctx Context, in *ExecuteWorkflowInput) (interface{}, error) {
+	t.trace = append(t.trace, "ExecuteWorkflow "+GetWorkflowInfo(ctx).WorkflowType.Name+" begin")
+	result, err := t.Next.ExecuteWorkflow(ctx, in)
+	t.trace = append(t.trace, "ExecuteWorkflow "+GetWorkflowInfo(ctx).WorkflowType.Name+" end")
+	return result, err
 }
 
-func (t *tracingOutboundCallsInterceptor) ExecuteActivity(ctx Context, activityType string, args ...interface{}) Future {
+func (t *tracingWorkflowOutboundInterceptor) ExecuteActivity(ctx Context, activityType string, args ...interface{}) Future {
 	t.inbound.trace = append(t.inbound.trace, "ExecuteActivity "+activityType)
 	return t.Next.ExecuteActivity(ctx, activityType, args...)
+}
+
+func TestStackTraceInvalidDepthBounded(t *testing.T) {
+	// Confirm at 2 depth there are 3 lines (1 for header, 2 for fn and path)
+	lines := strings.Split(getStackTrace("mycoroutine", "success", 2), "\n")
+	require.Len(t, lines, 3)
+	// But at invalid 100 depth, there are more than three lines but less than 100
+	// because we show the full trace when bounds are wrong
+	lines = strings.Split(getStackTrace("mycoroutine", "success", 100), "\n")
+	require.True(t, len(lines) > 3 && len(lines) < 100)
 }

@@ -29,8 +29,6 @@ package internal
 import (
 	"errors"
 	"fmt"
-	"math"
-	"os"
 	"reflect"
 	"runtime"
 	"strings"
@@ -84,8 +82,8 @@ type (
 	// Dispatcher is a container of a set of coroutines.
 	dispatcher interface {
 		// ExecuteUntilAllBlocked executes coroutines one by one in deterministic order
-		// until all of them are completed or blocked on Channel or Selector
-		ExecuteUntilAllBlocked() (err error)
+		// until all of them are completed or blocked on Channel or Selector or timeout is reached.
+		ExecuteUntilAllBlocked(deadlockDetectionTimeout time.Duration) (err error)
 		// IsDone returns true when all of coroutines are completed
 		IsDone() bool
 		IsExecuting() bool
@@ -170,7 +168,7 @@ type (
 		executing        bool       // currently running ExecuteUntilAllBlocked. Used to avoid recursive calls to it.
 		mutex            sync.Mutex // used to synchronize executing
 		closed           bool
-		interceptor      WorkflowOutboundCallsInterceptor
+		interceptor      WorkflowOutboundInterceptor
 	}
 
 	// WorkflowOptions options passed to the workflow function
@@ -193,7 +191,7 @@ type (
 		SearchAttributes         map[string]interface{}
 		ParentClosePolicy        enumspb.ParentClosePolicy
 		signalChannels           map[string]Channel
-		queryHandlers            map[string]func(*commonpb.Payloads) (*commonpb.Payloads, error)
+		queryHandlers            map[string]*queryHandler
 	}
 
 	// ExecuteWorkflowParams parameters of the workflow invocation
@@ -247,7 +245,7 @@ type (
 
 const (
 	workflowEnvironmentContextKey    = "workflowEnv"
-	workflowInterceptorsContextKey   = "workflowInterceptor"
+	workflowInterceptorContextKey    = "workflowInterceptor"
 	localActivityFnContextKey        = "localActivityFn"
 	workflowEnvInterceptorContextKey = "envInterceptor"
 	workflowResultContextKey         = "workflowResult"
@@ -262,7 +260,6 @@ var _ WaitGroup = (*waitGroupImpl)(nil)
 var _ dispatcher = (*dispatcherImpl)(nil)
 
 var stackBuf [100000]byte
-var debugMode = os.Getenv("TEMPORAL_DEBUG") != ""
 
 // Pointer to pointer to workflow result
 func getWorkflowResultPointerPointer(ctx Context) **workflowResult {
@@ -292,21 +289,21 @@ func getWorkflowEnvironmentInterceptor(ctx Context) *workflowEnvironmentIntercep
 type workflowEnvironmentInterceptor struct {
 	env                 WorkflowEnvironment
 	dispatcher          dispatcher
-	inboundInterceptor  WorkflowInboundCallsInterceptor
+	inboundInterceptor  WorkflowInboundInterceptor
 	fn                  interface{}
-	outboundInterceptor WorkflowOutboundCallsInterceptor
+	outboundInterceptor WorkflowOutboundInterceptor
 }
 
 func (wc *workflowEnvironmentInterceptor) Go(ctx Context, name string, f func(ctx Context)) Context {
 	return wc.dispatcher.NewCoroutine(ctx, name, f)
 }
 
-func getWorkflowOutboundCallsInterceptor(ctx Context) WorkflowOutboundCallsInterceptor {
-	wc := ctx.Value(workflowInterceptorsContextKey)
+func getWorkflowOutboundInterceptor(ctx Context) WorkflowOutboundInterceptor {
+	wc := ctx.Value(workflowInterceptorContextKey)
 	if wc == nil {
-		panic("getWorkflowOutboundCallsInterceptor: Not a workflow context")
+		panic("getWorkflowOutboundInterceptor: Not a workflow context")
 	}
-	return wc.(WorkflowOutboundCallsInterceptor)
+	return wc.(WorkflowOutboundInterceptor)
 }
 
 func (f *futureImpl) Get(ctx Context, valuePtr interface{}) error {
@@ -335,7 +332,12 @@ func (f *futureImpl) Get(ctx Context, valuePtr interface{}) error {
 	}
 
 	fv := reflect.ValueOf(f.value)
-	if fv.IsValid() {
+	// If the value set was a pointer and is the same type as the wanted result,
+	// instead of panicking because it is not a pointer to a pointer, we will just
+	// set the pointer
+	if fv.Kind() == reflect.Ptr && fv.Type() == rf.Type() {
+		rf.Elem().Set(fv.Elem())
+	} else {
 		rf.Elem().Set(fv)
 	}
 	return f.err
@@ -431,55 +433,59 @@ func (f *childWorkflowFutureImpl) SignalChildWorkflow(ctx Context, signalName st
 		return f.GetChildWorkflowExecution()
 	}
 
-	const childWorkflowOnly = true // this means we are targeting child workflow
-	// below we use empty run ID indicating the current running one, in case child do continue-as-new
-	return signalExternalWorkflow(ctx, childExec.ID, "", signalName, data, childWorkflowOnly)
+	i := getWorkflowOutboundInterceptor(ctx)
+	// Put header on context before executing
+	ctx = workflowContextWithNewHeader(ctx)
+	return i.SignalChildWorkflow(ctx, childExec.ID, signalName, data)
 }
 
-func newWorkflowContext(env WorkflowEnvironment, interceptors WorkflowOutboundCallsInterceptor, envInterceptor *workflowEnvironmentInterceptor) Context {
-	rootCtx := WithValue(background, workflowEnvironmentContextKey, env)
-	rootCtx = WithValue(rootCtx, workflowEnvInterceptorContextKey, envInterceptor)
-	rootCtx = WithValue(rootCtx, workflowInterceptorsContextKey, interceptors)
-
+func newWorkflowContext(
+	env WorkflowEnvironment,
+	interceptors []WorkerInterceptor,
+) (*workflowEnvironmentInterceptor, Context, error) {
+	// Create context with default values
+	ctx := WithValue(background, workflowEnvironmentContextKey, env)
 	var resultPtr *workflowResult
-	rootCtx = WithValue(rootCtx, workflowResultContextKey, &resultPtr)
+	ctx = WithValue(ctx, workflowResultContextKey, &resultPtr)
+	info := env.WorkflowInfo()
+	ctx = WithWorkflowNamespace(ctx, info.Namespace)
+	ctx = WithWorkflowTaskQueue(ctx, info.TaskQueueName)
+	getWorkflowEnvOptions(ctx).WorkflowExecutionTimeout = info.WorkflowExecutionTimeout
+	ctx = WithWorkflowRunTimeout(ctx, info.WorkflowRunTimeout)
+	ctx = WithWorkflowTaskTimeout(ctx, info.WorkflowTaskTimeout)
+	ctx = WithTaskQueue(ctx, info.TaskQueueName)
+	ctx = WithDataConverter(ctx, env.GetDataConverter())
+	ctx = withContextPropagators(ctx, env.GetContextPropagators())
+	getActivityOptions(ctx).OriginalTaskQueueName = info.TaskQueueName
 
-	// Set default values for the workflow execution.
-	wInfo := env.WorkflowInfo()
-	rootCtx = WithWorkflowNamespace(rootCtx, wInfo.Namespace)
-	rootCtx = WithWorkflowTaskQueue(rootCtx, wInfo.TaskQueueName)
-	getWorkflowEnvOptions(rootCtx).WorkflowExecutionTimeout = wInfo.WorkflowExecutionTimeout
-	rootCtx = WithWorkflowRunTimeout(rootCtx, wInfo.WorkflowRunTimeout)
-	rootCtx = WithWorkflowTaskTimeout(rootCtx, wInfo.WorkflowTaskTimeout)
-	rootCtx = WithTaskQueue(rootCtx, wInfo.TaskQueueName)
-	rootCtx = WithDataConverter(rootCtx, env.GetDataConverter())
-	rootCtx = withContextPropagators(rootCtx, env.GetContextPropagators())
-	getActivityOptions(rootCtx).OriginalTaskQueueName = wInfo.TaskQueueName
-
-	return rootCtx
-}
-
-func newWorkflowInterceptors(env WorkflowEnvironment, interceptors []WorkflowInterceptor) (*workflowEnvironmentInterceptor, error) {
+	// Create interceptor and put it on context as inbound and put it on context
+	// as the default outbound interceptor before init
 	envInterceptor := &workflowEnvironmentInterceptor{env: env}
-	var interceptor WorkflowInboundCallsInterceptor = envInterceptor
+	envInterceptor.inboundInterceptor = envInterceptor
+	envInterceptor.outboundInterceptor = envInterceptor
+	ctx = WithValue(ctx, workflowEnvInterceptorContextKey, envInterceptor)
+	ctx = WithValue(ctx, workflowInterceptorContextKey, envInterceptor.outboundInterceptor)
+
+	// Intercept, run init, and put the new outbound interceptor on the context
 	for i := len(interceptors) - 1; i >= 0; i-- {
-		interceptor = interceptors[i].InterceptWorkflow(env.WorkflowInfo(), interceptor)
+		envInterceptor.inboundInterceptor = interceptors[i].InterceptWorkflow(ctx, envInterceptor.inboundInterceptor)
 	}
-	envInterceptor.inboundInterceptor = interceptor
-	err := interceptor.Init(envInterceptor)
+	err := envInterceptor.inboundInterceptor.Init(envInterceptor)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return envInterceptor, nil
+	ctx = WithValue(ctx, workflowInterceptorContextKey, envInterceptor.outboundInterceptor)
+
+	return envInterceptor, ctx, nil
 }
 
 func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *commonpb.Header, input *commonpb.Payloads) {
-	envInterceptor, err := newWorkflowInterceptors(env, env.GetRegistry().getInterceptors())
+	envInterceptor, rootCtx, err := newWorkflowContext(env, env.GetRegistry().interceptors)
 	if err != nil {
 		panic(err)
 	}
 	dispatcher, rootCtx := newDispatcher(
-		newWorkflowContext(env, envInterceptor.outboundInterceptor, envInterceptor),
+		rootCtx,
 		envInterceptor,
 		func(ctx Context) {
 			r := &workflowResult{}
@@ -497,11 +503,9 @@ func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *common
 		})
 
 	// set the information from the headers that is to be propagated in the workflow context
-	for _, ctxProp := range env.GetContextPropagators() {
-		var err error
-		if rootCtx, err = ctxProp.ExtractToWorkflow(rootCtx, NewHeaderReader(header)); err != nil {
-			panic(fmt.Sprintf("Unable to propagate context: %v", err))
-		}
+	rootCtx, err = workflowContextWithHeaderPropagated(rootCtx, header, env.GetContextPropagators())
+	if err != nil {
+		panic(err)
 	}
 
 	d.rootCtx, d.cancel = WithCancel(rootCtx)
@@ -514,32 +518,61 @@ func (d *syncWorkflowDefinition) Execute(env WorkflowEnvironment, header *common
 		d.cancel()
 	})
 
-	getWorkflowEnvironment(d.rootCtx).RegisterSignalHandler(func(name string, result *commonpb.Payloads) {
-		eo := getWorkflowEnvOptions(d.rootCtx)
-		// We don't want this code to be blocked ever, using sendAsync().
-		ch := eo.getSignalChannel(d.rootCtx, name).(*channelImpl)
-		ok := ch.SendAsync(result)
-		if !ok {
-			panic(fmt.Sprintf("Exceeded channel buffer size for signal: %v", name))
-		}
-	})
-
-	getWorkflowEnvironment(d.rootCtx).RegisterQueryHandler(func(queryType string, queryArgs *commonpb.Payloads) (*commonpb.Payloads, error) {
-		eo := getWorkflowEnvOptions(d.rootCtx)
-		handler, ok := eo.queryHandlers[queryType]
-		if !ok {
-			keys := []string{QueryTypeStackTrace, QueryTypeOpenSessions}
-			for k := range eo.queryHandlers {
-				keys = append(keys, k)
+	getWorkflowEnvironment(d.rootCtx).RegisterSignalHandler(
+		func(name string, input *commonpb.Payloads, header *commonpb.Header) error {
+			// Put the header on context
+			rootCtx, err := workflowContextWithHeaderPropagated(d.rootCtx, header, env.GetContextPropagators())
+			if err != nil {
+				return err
 			}
-			return nil, fmt.Errorf("unknown queryType %v. KnownQueryTypes=%v", queryType, keys)
-		}
-		return handler(queryArgs)
-	})
+			return envInterceptor.inboundInterceptor.HandleSignal(rootCtx, &HandleSignalInput{SignalName: name, Arg: input})
+		},
+	)
+
+	getWorkflowEnvironment(d.rootCtx).RegisterQueryHandler(
+		func(queryType string, queryArgs *commonpb.Payloads, header *commonpb.Header) (*commonpb.Payloads, error) {
+			// Put the header on context if server supports it
+			rootCtx, err := workflowContextWithHeaderPropagated(d.rootCtx, header, env.GetContextPropagators())
+			if err != nil {
+				return nil, err
+			}
+
+			eo := getWorkflowEnvOptions(rootCtx)
+			// A handler must be present since it is needed for argument decoding,
+			// even if the interceptor intercepts query handling
+			handler, ok := eo.queryHandlers[queryType]
+			if !ok {
+				keys := []string{QueryTypeStackTrace, QueryTypeOpenSessions}
+				for k := range eo.queryHandlers {
+					keys = append(keys, k)
+				}
+				return nil, fmt.Errorf("unknown queryType %v. KnownQueryTypes=%v", queryType, keys)
+			}
+
+			// Decode the arguments
+			args, err := decodeArgsToRawValues(handler.dataConverter, reflect.TypeOf(handler.fn), queryArgs)
+			if err != nil {
+				return nil, fmt.Errorf("unable to decode the input for queryType: %v, with error: %w", handler.queryType, err)
+			}
+
+			// Invoke
+			result, err := envInterceptor.inboundInterceptor.HandleQuery(
+				rootCtx,
+				&HandleQueryInput{QueryType: queryType, Args: args},
+			)
+
+			// Encode the result
+			var serializedResult *commonpb.Payloads
+			if err == nil && result != nil {
+				serializedResult, err = encodeArg(handler.dataConverter, result)
+			}
+			return serializedResult, err
+		},
+	)
 }
 
-func (d *syncWorkflowDefinition) OnWorkflowTaskStarted() {
-	executeDispatcher(d.rootCtx, d.dispatcher)
+func (d *syncWorkflowDefinition) OnWorkflowTaskStarted(deadlockDetectionTimeout time.Duration) {
+	executeDispatcher(d.rootCtx, d.dispatcher, deadlockDetectionTimeout)
 }
 
 func (d *syncWorkflowDefinition) StackTrace() string {
@@ -564,9 +597,9 @@ func newDispatcher(rootCtx Context, interceptor *workflowEnvironmentInterceptor,
 
 // executeDispatcher executed coroutines in the calling thread and calls workflow completion callbacks
 // if root workflow function returned
-func executeDispatcher(ctx Context, dispatcher dispatcher) {
+func executeDispatcher(ctx Context, dispatcher dispatcher, timeout time.Duration) {
 	env := getWorkflowEnvironment(ctx)
-	panicErr := dispatcher.ExecuteUntilAllBlocked()
+	panicErr := dispatcher.ExecuteUntilAllBlocked(timeout)
 	if panicErr != nil {
 		env.Complete(nil, panicErr)
 		return
@@ -808,7 +841,7 @@ func (c *channelImpl) assignValue(from interface{}, to interface{}) error {
 	// add to metrics
 	if err != nil {
 		c.env.GetLogger().Error(fmt.Sprintf("Deserialization error. Corrupted signal received on channel %s.", c.name), tagError, err)
-		c.env.GetMetricsScope().Counter(metrics.CorruptedSignalsCounter).Inc(1)
+		c.env.GetMetricsHandler().Counter(metrics.CorruptedSignalsCounter).Inc(1)
 	}
 	return err
 }
@@ -851,7 +884,13 @@ func getStackTraceRaw(top string, omitTop, omitBottom int) string {
 		return rawStack
 	}
 	lines := strings.Split(rawStack, "\n")
-	lines = lines[omitTop : len(lines)-omitBottom]
+	omitEnd := len(lines) - omitBottom
+	// If the start is after the end, the depth was invalid originally so return
+	// the entire raw stack
+	if omitTop > omitEnd {
+		return rawStack
+	}
+	lines = lines[omitTop:omitEnd]
 	lines = append([]string{top}, lines...)
 	return strings.Join(lines, "\n")
 }
@@ -862,16 +901,21 @@ func (s *coroutineState) unblocked() {
 	s.keptBlocked = false
 }
 
-func (s *coroutineState) call() {
+func (s *coroutineState) call(timeout time.Duration) {
 	s.unblock <- func(status string, stackDepth int) bool {
 		return false // unblock
 	}
 
-	deadlockDetectorTimeout := time.Second
-	if debugMode {
-		deadlockDetectorTimeout = math.MaxInt64
+	// Defaults are populated in the worker options during worker startup, but test environment
+	// may have no default value for the deadlock detection timeout, so we also need to set it here for
+	// backwards compatibility.
+	if timeout == 0 {
+		timeout = defaultDeadlockDetectionTimeout
+		if debugMode {
+			timeout = unlimitedDeadlockDetectionTimeout
+		}
 	}
-	deadlockTimer := time.NewTimer(deadlockDetectorTimeout)
+	deadlockTimer := time.NewTimer(timeout)
 	defer func() { deadlockTimer.Stop() }()
 
 	select {
@@ -941,7 +985,7 @@ func (d *dispatcherImpl) newState(name string) *coroutineState {
 	return c
 }
 
-func (d *dispatcherImpl) ExecuteUntilAllBlocked() (err error) {
+func (d *dispatcherImpl) ExecuteUntilAllBlocked(deadlockDetectionTimeout time.Duration) (err error) {
 	d.mutex.Lock()
 	if d.closed {
 		panic("dispatcher is closed")
@@ -951,7 +995,11 @@ func (d *dispatcherImpl) ExecuteUntilAllBlocked() (err error) {
 	}
 	d.executing = true
 	d.mutex.Unlock()
-	defer func() { d.executing = false }()
+	defer func() {
+		d.mutex.Lock()
+		d.executing = false
+		d.mutex.Unlock()
+	}()
 	allBlocked := false
 	// Keep executing until at least one goroutine made some progress
 	for !allBlocked {
@@ -963,7 +1011,7 @@ func (d *dispatcherImpl) ExecuteUntilAllBlocked() (err error) {
 			if !c.closed.Load() {
 				// TODO: Support handling of panic in a coroutine by dispatcher.
 				// TODO: Dump all outstanding coroutines if one of them panics
-				c.call()
+				c.call(deadlockDetectionTimeout)
 			}
 			// c.call() can close the context so check again
 			if c.closed.Load() {
@@ -990,10 +1038,14 @@ func (d *dispatcherImpl) ExecuteUntilAllBlocked() (err error) {
 }
 
 func (d *dispatcherImpl) IsDone() bool {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
 	return len(d.coroutines) == 0
 }
 
 func (d *dispatcherImpl) IsExecuting() bool {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
 	return d.executing
 }
 
@@ -1227,7 +1279,7 @@ func setWorkflowEnvOptionsIfNotExist(ctx Context) Context {
 		newOptions = *options
 	} else {
 		newOptions.signalChannels = make(map[string]Channel)
-		newOptions.queryHandlers = make(map[string]func(*commonpb.Payloads) (*commonpb.Payloads, error))
+		newOptions.queryHandlers = make(map[string]*queryHandler)
 	}
 	if newOptions.DataConverter == nil {
 		newOptions.DataConverter = converter.GetDefaultDataConverter()
@@ -1252,22 +1304,6 @@ func getDataConverterFromWorkflowContext(ctx Context) converter.DataConverter {
 func getRegistryFromWorkflowContext(ctx Context) *registry {
 	env := getWorkflowEnvironment(ctx)
 	return env.GetRegistry()
-}
-
-func getContextPropagatorsFromWorkflowContext(ctx Context) []ContextPropagator {
-	options := getWorkflowEnvOptions(ctx)
-	return options.ContextPropagators
-}
-
-func getHeadersFromContext(ctx Context) *commonpb.Header {
-	header := &commonpb.Header{
-		Fields: make(map[string]*commonpb.Payload),
-	}
-	contextPropagators := getContextPropagatorsFromWorkflowContext(ctx)
-	for _, ctxProp := range contextPropagators {
-		_ = ctxProp.InjectFromWorkflow(ctx, NewHeaderWriter(header))
-	}
-	return header
 }
 
 // getSignalChannel finds the associated channel for the signal.
@@ -1333,7 +1369,7 @@ func setQueryHandler(ctx Context, queryType string, handler interface{}) error {
 		return err
 	}
 
-	getWorkflowEnvOptions(ctx).queryHandlers[queryType] = qh.execute
+	getWorkflowEnvOptions(ctx).queryHandlers[queryType] = qh
 	return nil
 }
 
@@ -1362,7 +1398,7 @@ func (h *queryHandler) validateHandlerFn() error {
 	return nil
 }
 
-func (h *queryHandler) execute(input *commonpb.Payloads) (result *commonpb.Payloads, err error) {
+func (h *queryHandler) execute(input []interface{}) (result interface{}, err error) {
 	// if query handler panic, convert it to error
 	defer func() {
 		if p := recover(); p != nil {
@@ -1378,37 +1414,7 @@ func (h *queryHandler) execute(input *commonpb.Payloads) (result *commonpb.Paylo
 		}
 	}()
 
-	fnType := reflect.TypeOf(h.fn)
-	var args []reflect.Value
-
-	decoded, err := decodeArgs(h.dataConverter, fnType, input)
-	if err != nil {
-		return nil, fmt.Errorf("unable to decode the input for queryType: %v, with error: %w", h.queryType, err)
-	}
-	args = append(args, decoded...)
-
-	// invoke the query handler with arguments.
-	fnValue := reflect.ValueOf(h.fn)
-	retValues := fnValue.Call(args)
-
-	// we already verified (in validateHandlerFn()) that the query handler returns 2 values
-	retValue := retValues[0]
-	if retValue.Kind() != reflect.Ptr || !retValue.IsNil() {
-		result, err = encodeArg(h.dataConverter, retValue.Interface())
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	errValue := retValues[1]
-	if errValue.IsNil() {
-		return result, nil
-	}
-	err, ok := errValue.Interface().(error)
-	if !ok {
-		return nil, fmt.Errorf("failed to parse error result as it is not of error interface: %v", errValue)
-	}
-	return result, err
+	return executeFunction(h.fn, input)
 }
 
 // Add adds delta, which may be negative, to the WaitGroup counter.

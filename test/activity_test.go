@@ -26,6 +26,7 @@ package test_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -33,11 +34,13 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 )
 
 type Activities struct {
+	client      client.Client
 	mu          sync.Mutex
 	invocations []string
 	activities2 *Activities2
@@ -92,10 +95,39 @@ func (a *Activities) LongRunningHeartbeat(ctx context.Context, delay time.Durati
 	endTime := time.Now().Add(delay)
 	for time.Now().Before(endTime) {
 		activity.RecordHeartbeat(ctx)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
 		time.Sleep(recordHeartbeatDelay)
 	}
 
 	return nil
+}
+
+func (a *Activities) HeartbeatTwiceAndFailNTimes(
+	ctx context.Context,
+	times int,
+	id string,
+) (heartbeatCounts int, err error) {
+	// Get details
+	if activity.HasHeartbeatDetails(ctx) {
+		if err = activity.GetHeartbeatDetails(ctx, &heartbeatCounts); err != nil {
+			return
+		}
+	}
+
+	// Heartbeat twice, incrementing before each
+	heartbeatCounts++
+	activity.RecordHeartbeat(ctx, heartbeatCounts)
+	heartbeatCounts++
+	activity.RecordHeartbeat(ctx, heartbeatCounts)
+
+	// Set error if haven't reached enough times
+	a.append(id)
+	if a.invokedCount(id) <= times {
+		err = errFailOnPurpose
+	}
+	return
 }
 
 func (a *Activities) fail(_ context.Context) error {
@@ -142,6 +174,33 @@ func (a *Activities) Echo(ctx context.Context, delayInSeconds int, value int) (i
 	}
 
 	return value, nil
+}
+
+func (a *Activities) WaitForWorkerStop(ctx context.Context, timeout time.Duration) (string, error) {
+	stopCh := activity.GetWorkerStopChannel(ctx)
+	// Mark activity as invoked then wait for it to be stopped
+	a.append("wait-for-worker-stop")
+	select {
+	case <-stopCh:
+		return "stopped", nil
+	case <-time.After(timeout):
+		return "timeout", nil
+	}
+}
+
+func (a *Activities) HeartbeatUntilCanceled(ctx context.Context, heartbeatFreq time.Duration) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(heartbeatFreq):
+			activity.RecordHeartbeat(ctx)
+		}
+	}
+}
+
+func (a *Activities) Panicked(ctx context.Context) ([]string, error) {
+	panic(fmt.Sprintf("simulated panic on attempt %v", activity.GetInfo(ctx).Attempt))
 }
 
 func (a *Activities) append(name string) {
@@ -219,6 +278,59 @@ func (a *Activities) PropagateActivity(ctx context.Context) ([]string, error) {
 	}
 
 	return result, nil
+}
+
+func (a *Activities) InterceptorCalls(ctx context.Context, someVal string) (string, error) {
+	someVal = "activity(" + someVal + ")"
+	// Make some calls
+	activity.GetInfo(ctx)
+	activity.GetLogger(ctx)
+	activity.GetMetricsHandler(ctx)
+	activity.RecordHeartbeat(ctx, "details")
+	activity.HasHeartbeatDetails(ctx)
+	_ = activity.GetHeartbeatDetails(ctx)
+	activity.GetWorkerStopChannel(ctx)
+	return someVal, nil
+}
+
+func (a *Activities) ExternalSignalsAndQueries(ctx context.Context) error {
+	// Signal with start
+	workflowOpts := client.StartWorkflowOptions{TaskQueue: activity.GetInfo(ctx).TaskQueue}
+	run, err := a.client.SignalWithStartWorkflow(ctx, "test-external-signals-and-queries", "start-signal",
+		"signal-value", workflowOpts, new(Workflows).SignalsAndQueries, false, false)
+	if err != nil {
+		return err
+	}
+
+	// Query
+	val, err := a.client.QueryWorkflow(ctx, run.GetID(), run.GetRunID(), "workflow-query", nil)
+	if err != nil {
+		return err
+	}
+	var queryResp string
+	if err := val.Get(&queryResp); err != nil {
+		return err
+	} else if queryResp != "query-response" {
+		return fmt.Errorf("bad query response")
+	}
+
+	// Finish signal
+	if err := a.client.SignalWorkflow(ctx, run.GetID(), run.GetRunID(), "finish-signal", nil); err != nil {
+		return err
+	}
+	return run.Get(ctx, nil)
+}
+
+func (*Activities) TooFewParams(
+	ctx context.Context,
+	param1 string,
+	param2 int,
+	param3 bool,
+	param4 struct{ SomeField string },
+	param5 *ParamsValue,
+	param6 []byte,
+) (*ParamsValue, error) {
+	return &ParamsValue{Param1: param1, Param2: param2, Param3: param3, Param4: param4, Param5: param5, Param6: param6}, nil
 }
 
 func (a *Activities) register(worker worker.Worker) {

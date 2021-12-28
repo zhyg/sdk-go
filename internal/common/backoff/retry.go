@@ -26,8 +26,11 @@ package backoff
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
+
+	"go.temporal.io/api/serviceerror"
 )
 
 type (
@@ -47,12 +50,13 @@ type (
 	}
 )
 
-// Throttle Sleep if there were failures since the last success call.
-func (c *ConcurrentRetrier) Throttle() {
-	c.throttleInternal()
+// Throttle Sleep if there were failures since the last success call. The
+// provided done channel provides a way to exit early.
+func (c *ConcurrentRetrier) Throttle(doneCh <-chan struct{}) {
+	c.throttleInternal(doneCh)
 }
 
-func (c *ConcurrentRetrier) throttleInternal() time.Duration {
+func (c *ConcurrentRetrier) throttleInternal(doneCh <-chan struct{}) time.Duration {
 	next := done
 
 	// Check if we have failure count.
@@ -63,7 +67,10 @@ func (c *ConcurrentRetrier) throttleInternal() time.Duration {
 	c.Unlock()
 
 	if next != done {
-		time.Sleep(next)
+		select {
+		case <-doneCh:
+		case <-time.After(next):
+		}
 	}
 
 	return next
@@ -92,24 +99,33 @@ func NewConcurrentRetrier(retryPolicy RetryPolicy) *ConcurrentRetrier {
 
 // Retry function can be used to wrap any call with retry logic using the passed in policy
 func Retry(ctx context.Context, operation Operation, policy RetryPolicy, isRetryable IsRetryable) error {
-	var err error
+	var lastErr error
 	var next time.Duration
 
 	r := NewRetrier(policy, SystemClock)
-RetryLoop:
 	for {
-		// operation completed successfully.  No need to retry.
-		if err = operation(); err == nil {
+		opErr := operation()
+		if opErr == nil {
+			// operation completed successfully. No need to retry.
 			return nil
 		}
 
+		// Usually, after number of retry attempts, last attempt fails with DeadlineExceeded error.
+		// It is not informative and actual error reason is in the error occurred on previous attempt.
+		// Therefore, update lastErr only if it is not set (first attempt) or opErr is not a DeadlineExceeded error.
+		// This lastErr is returned if retry attempts are exhausted.
+		var errDeadlineExceeded *serviceerror.DeadlineExceeded
+		if lastErr == nil || !(errors.Is(opErr, context.DeadlineExceeded) || errors.As(opErr, &errDeadlineExceeded)) {
+			lastErr = opErr
+		}
+
 		if next = r.NextBackOff(); next == done {
-			return err
+			return lastErr
 		}
 
 		// Check if the error is retryable
-		if isRetryable != nil && !isRetryable(err) {
-			return err
+		if isRetryable != nil && !isRetryable(opErr) {
+			return lastErr
 		}
 
 		// check if ctx is done
@@ -117,9 +133,9 @@ RetryLoop:
 			timer := time.NewTimer(next)
 			select {
 			case <-ctxDone:
-				return err
+				return lastErr
 			case <-timer.C:
-				continue RetryLoop
+				continue
 			}
 		}
 

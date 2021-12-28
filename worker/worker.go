@@ -187,6 +187,10 @@ type (
 	// versioning (see workflow.GetVersion).
 	// The default behavior is to block workflow execution until the problem is fixed.
 	WorkflowPanicPolicy = internal.WorkflowPanicPolicy
+
+	// WorkflowReplayerOptions are options used for
+	// NewWorkflowReplayerWithOptions.
+	WorkflowReplayerOptions = internal.WorkflowReplayerOptions
 )
 
 const (
@@ -202,7 +206,7 @@ const (
 )
 
 // New creates an instance of worker for managing workflow and activity executions.
-//    namespace   - the name of the temporal namespace
+//    client    - the client for use by the worker
 //    taskQueue - is the task queue name you use to identify your client worker, also
 //               identifies group of workflow and activity implementations that are
 //               hosted by a single worker process
@@ -217,7 +221,17 @@ func New(
 
 // NewWorkflowReplayer creates a WorkflowReplayer instance.
 func NewWorkflowReplayer() WorkflowReplayer {
-	return internal.NewWorkflowReplayer()
+	w, err := NewWorkflowReplayerWithOptions(WorkflowReplayerOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return w
+}
+
+// NewWorkflowReplayerWithOptions creates a WorkflowReplayer instance with the
+// given options.
+func NewWorkflowReplayerWithOptions(options WorkflowReplayerOptions) (WorkflowReplayer, error) {
+	return internal.NewWorkflowReplayer(options)
 }
 
 // EnableVerboseLogging enable or disable verbose logging of internal Temporal library components.

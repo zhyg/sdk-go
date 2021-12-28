@@ -35,11 +35,9 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/mock/gomock"
-	"github.com/opentracing/opentracing-go"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/uber-go/tally"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -52,6 +50,7 @@ import (
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common"
+	"go.temporal.io/sdk/internal/common/metrics"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
 )
@@ -241,6 +240,13 @@ func createTestEventWorkflowTaskFailed(eventID int64, attr *historypb.WorkflowTa
 		Attributes: &historypb.HistoryEvent_WorkflowTaskFailedEventAttributes{WorkflowTaskFailedEventAttributes: attr}}
 }
 
+func createTestEventWorkflowTaskTimedOut(eventID int64, attr *historypb.WorkflowTaskTimedOutEventAttributes) *historypb.HistoryEvent {
+	return &historypb.HistoryEvent{
+		EventId:    eventID,
+		EventType:  enumspb.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT,
+		Attributes: &historypb.HistoryEvent_WorkflowTaskTimedOutEventAttributes{WorkflowTaskTimedOutEventAttributes: attr}}
+}
+
 func createTestEventSignalExternalWorkflowExecutionFailed(eventID int64, attr *historypb.SignalExternalWorkflowExecutionFailedEventAttributes) *historypb.HistoryEvent {
 	return &historypb.HistoryEvent{
 		EventId:    eventID,
@@ -260,6 +266,13 @@ func createTestEventChildWorkflowExecutionStarted(eventID int64, attr *historypb
 		EventId:    eventID,
 		EventType:  enumspb.EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED,
 		Attributes: &historypb.HistoryEvent_ChildWorkflowExecutionStartedEventAttributes{ChildWorkflowExecutionStartedEventAttributes: attr}}
+}
+
+func createTestEventStartChildWorkflowExecutionFailed(eventID int64, attr *historypb.StartChildWorkflowExecutionFailedEventAttributes) *historypb.HistoryEvent {
+	return &historypb.HistoryEvent{
+		EventId:    eventID,
+		EventType:  enumspb.EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_FAILED,
+		Attributes: &historypb.HistoryEvent_StartChildWorkflowExecutionFailedEventAttributes{StartChildWorkflowExecutionFailedEventAttributes: attr}}
 }
 
 func createTestEventRequestCancelExternalWorkflowExecutionInitiated(eventID int64, attr *historypb.RequestCancelExternalWorkflowExecutionInitiatedEventAttributes) *historypb.HistoryEvent {
@@ -310,6 +323,33 @@ func createTestEventVersionMarker(eventID int64, workflowTaskCompletedID int64, 
 				Details: map[string]*commonpb.Payloads{
 					versionMarkerChangeIDName: changeIDPayload,
 					versionMarkerDataName:     versionPayload,
+				},
+				WorkflowTaskCompletedEventId: workflowTaskCompletedID,
+			},
+		},
+	}
+}
+
+func createTestEventSideEffectMarker(eventID int64, workflowTaskCompletedID int64, sideEffectID int64, result int) *historypb.HistoryEvent {
+	sideEffectIDPayload, err := converter.GetDefaultDataConverter().ToPayloads(sideEffectID)
+	if err != nil {
+		panic(err)
+	}
+
+	resultPayload, err := converter.GetDefaultDataConverter().ToPayloads(result)
+	if err != nil {
+		panic(err)
+	}
+
+	return &historypb.HistoryEvent{
+		EventId:   eventID,
+		EventType: enumspb.EVENT_TYPE_MARKER_RECORDED,
+		Attributes: &historypb.HistoryEvent_MarkerRecordedEventAttributes{
+			MarkerRecordedEventAttributes: &historypb.MarkerRecordedEventAttributes{
+				MarkerName: sideEffectMarkerName,
+				Details: map[string]*commonpb.Payloads{
+					sideEffectMarkerIDName:   sideEffectIDPayload,
+					sideEffectMarkerDataName: resultPayload,
 				},
 				WorkflowTaskCompletedEventId: workflowTaskCompletedID,
 			},
@@ -422,12 +462,12 @@ var testWorkflowTaskTaskqueue = "tq1"
 func (t *TaskHandlersTestSuite) getTestWorkerExecutionParams() workerExecutionParameters {
 	cache := NewWorkerCache()
 	return workerExecutionParameters{
-		TaskQueue: testWorkflowTaskTaskqueue,
-		Namespace: testNamespace,
-		Identity:  "test-id-1",
-		Logger:    t.logger,
-		cache:     cache,
-		Tracer:    opentracing.NoopTracer{},
+		TaskQueue:      testWorkflowTaskTaskqueue,
+		Namespace:      testNamespace,
+		Identity:       "test-id-1",
+		MetricsHandler: metrics.NopHandler,
+		Logger:         t.logger,
+		cache:          cache,
 	}
 }
 
@@ -665,7 +705,7 @@ func (t *TaskHandlersTestSuite) TestCacheEvictionWhenErrorOccurs() {
 	task := createWorkflowTask(testEvents, 3, "HelloWorld_Workflow")
 	// newWorkflowTaskWorkerInternal will set the laTunnel in taskHandler, without it, ProcessWorkflowTask()
 	// will fail as it can't find laTunnel in newWorkerCache().
-	newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}))
+	newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}), nil)
 	request, err := taskHandler.ProcessWorkflowTask(&workflowTask{task: task}, nil)
 
 	t.Error(err)
@@ -693,7 +733,7 @@ func (t *TaskHandlersTestSuite) TestWithMissingHistoryEvents() {
 		task := createWorkflowTask(testEvents, startEventID, "HelloWorld_Workflow")
 		// newWorkflowTaskWorkerInternal will set the laTunnel in taskHandler, without it, ProcessWorkflowTask()
 		// will fail as it can't find laTunnel in newWorkerCache().
-		newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}))
+		newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}), nil)
 		request, err := taskHandler.ProcessWorkflowTask(&workflowTask{task: task}, nil)
 
 		t.Error(err)
@@ -744,7 +784,7 @@ func (t *TaskHandlersTestSuite) TestWithTruncatedHistory() {
 		task.StartedEventId = tc.startedEventID
 		// newWorkflowTaskWorkerInternal will set the laTunnel in taskHandler, without it, ProcessWorkflowTask()
 		// will fail as it can't find laTunnel in newWorkerCache().
-		newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}))
+		newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}), nil)
 		request, err := taskHandler.ProcessWorkflowTask(&workflowTask{task: task}, nil)
 
 		if tc.isResultErr {
@@ -847,7 +887,7 @@ func (t *TaskHandlersTestSuite) TestWorkflowTask_NondeterministicDetection() {
 	task = createWorkflowTask(testEvents, 3, "HelloWorld_Workflow")
 	// newWorkflowTaskWorkerInternal will set the laTunnel in taskHandler, without it, ProcessWorkflowTask()
 	// will fail as it can't find laTunnel in newWorkerCache().
-	newWorkflowTaskWorkerInternal(taskHandler, t.service, params, stopC)
+	newWorkflowTaskWorkerInternal(taskHandler, t.service, params, stopC, nil)
 	request, err = taskHandler.ProcessWorkflowTask(&workflowTask{task: task}, nil)
 	t.Error(err)
 	t.Nil(request)
@@ -993,7 +1033,7 @@ func (t *TaskHandlersTestSuite) TestConsistentQuery_InvalidQueryTask() {
 	task := createWorkflowTask(testEvents, 3, "HelloWorld_Workflow")
 	task.Query = &querypb.WorkflowQuery{}
 	task.Queries = map[string]*querypb.WorkflowQuery{"query_id": {}}
-	newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}))
+	newWorkflowTaskWorkerInternal(taskHandler, t.service, params, make(chan struct{}), nil)
 	// query and queries are both specified so this is an invalid task
 	request, err := taskHandler.ProcessWorkflowTask(&workflowTask{task: task}, nil)
 
@@ -1190,7 +1230,7 @@ func (t *TaskHandlersTestSuite) TestLocalActivityRetry_Workflow() {
 	t.True(ok)
 	taskHandlerImpl.laTunnel = laTunnel
 
-	laTaskPoller := newLocalActivityPoller(params, laTunnel)
+	laTaskPoller := newLocalActivityPoller(params, laTunnel, nil)
 	go func() {
 		for {
 			task, _ := laTaskPoller.PollTask()
@@ -1219,7 +1259,7 @@ func (t *TaskHandlersTestSuite) TestLocalActivityRetry_Workflow() {
 }
 
 func (t *TaskHandlersTestSuite) TestLocalActivityRetry_WorkflowTaskHeartbeatFail() {
-	backoffInterval := 1 * time.Second
+	backoffInterval := 50 * time.Millisecond
 	workflowComplete := false
 
 	retryLocalActivityWorkflowFunc := func(ctx Context, input []byte) error {
@@ -1248,10 +1288,12 @@ func (t *TaskHandlersTestSuite) TestLocalActivityRetry_WorkflowTaskHeartbeatFail
 	workflowTaskStartedEvent := createTestEventWorkflowTaskStarted(3)
 	now := time.Now()
 	workflowTaskStartedEvent.EventTime = &now
+	// WFT timeout must be larger than the local activity backoff or the local activity is not retried
+	wftTimeout := 500 * time.Millisecond
 	testEvents := []*historypb.HistoryEvent{
 		createTestEventWorkflowExecutionStarted(1, &historypb.WorkflowExecutionStartedEventAttributes{
 			// make sure the timeout is same as the backoff interval
-			WorkflowTaskTimeout: &backoffInterval,
+			WorkflowTaskTimeout: &wftTimeout,
 			TaskQueue:           &taskqueuepb.TaskQueue{Name: testWorkflowTaskTaskqueue}},
 		),
 		createTestEventWorkflowTaskScheduled(2, &historypb.WorkflowTaskScheduledEventAttributes{}),
@@ -1270,7 +1312,7 @@ func (t *TaskHandlersTestSuite) TestLocalActivityRetry_WorkflowTaskHeartbeatFail
 	t.True(ok)
 	taskHandlerImpl.laTunnel = laTunnel
 
-	laTaskPoller := newLocalActivityPoller(params, laTunnel)
+	laTaskPoller := newLocalActivityPoller(params, laTunnel, nil)
 	doneCh := make(chan struct{})
 	go func() {
 		// laTaskPoller needs to poll the local activity and process it
@@ -1293,7 +1335,7 @@ func (t *TaskHandlersTestSuite) TestLocalActivityRetry_WorkflowTaskHeartbeatFail
 			laResultCh: laResultCh,
 		},
 		func(response interface{}, startTime time.Time) (*workflowTask, error) {
-			return nil, serviceerror.NewNotFound("Workflow task not found.")
+			return nil, serviceerror.NewNotFound("Intentional wft heartbeat error")
 		})
 	t.Nil(response)
 	t.Error(err)
@@ -1316,10 +1358,10 @@ func (t *TaskHandlersTestSuite) TestHeartBeat_NoError() {
 		Times(2)
 
 	temporalInvoker := &temporalInvoker{
-		identity:         "Test_Temporal_Invoker",
-		service:          mockService,
-		taskToken:        nil,
-		heartBeatTimeout: time.Second,
+		identity:                  "Test_Temporal_Invoker",
+		service:                   mockService,
+		taskToken:                 nil,
+		heartbeatThrottleInterval: time.Second,
 	}
 
 	heartbeatErr := temporalInvoker.Heartbeat(context.Background(), nil, false)
@@ -1354,10 +1396,13 @@ func (t *TaskHandlersTestSuite) TestHeartBeat_NilResponseWithError() {
 	mockService.EXPECT().RecordActivityTaskHeartbeat(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, serviceerror.NewNotFound(""))
 
 	temporalInvoker := newServiceInvoker(
-		nil, "Test_Temporal_Invoker", mockService, tally.NoopScope, func() {}, 0,
+		nil, "Test_Temporal_Invoker", mockService, metrics.NopHandler, func() {}, 0,
 		make(chan struct{}), t.namespace)
 
-	heartbeatErr := temporalInvoker.Heartbeat(context.Background(), nil, false)
+	ctx, err := newActivityContext(context.Background(), nil, &activityEnvironment{serviceInvoker: temporalInvoker, logger: t.logger})
+	t.NoError(err)
+
+	heartbeatErr := temporalInvoker.Heartbeat(ctx, nil, false)
 	t.NotNil(heartbeatErr)
 	t.IsType(&serviceerror.NotFound{}, heartbeatErr, "heartbeatErr must be of type NotFound.")
 }
@@ -1372,10 +1417,13 @@ func (t *TaskHandlersTestSuite) TestHeartBeat_NilResponseWithNamespaceNotActiveE
 	cancelHandler := func() { called = true }
 
 	temporalInvoker := newServiceInvoker(
-		nil, "Test_Temporal_Invoker", mockService, tally.NoopScope, cancelHandler,
+		nil, "Test_Temporal_Invoker", mockService, metrics.NopHandler, cancelHandler,
 		0, make(chan struct{}), t.namespace)
 
-	heartbeatErr := temporalInvoker.Heartbeat(context.Background(), nil, false)
+	ctx, err := newActivityContext(context.Background(), nil, &activityEnvironment{serviceInvoker: temporalInvoker, logger: t.logger})
+	t.NoError(err)
+
+	heartbeatErr := temporalInvoker.Heartbeat(ctx, nil, false)
 	t.NotNil(heartbeatErr)
 	t.IsType(&serviceerror.NamespaceNotActive{}, heartbeatErr, "heartbeatErr must be of type NamespaceNotActive.")
 	t.True(called)
@@ -1412,20 +1460,22 @@ type deadlineTest struct {
 	ScheduleDuration time.Duration
 	StartTS          time.Time
 	StartDuration    time.Duration
+	ActivityType     string
 	err              error
 }
 
 func (t *TaskHandlersTestSuite) TestActivityExecutionDeadline() {
 	deadlineTests := []deadlineTest{
-		{0, time.Now(), 3 * time.Second, time.Now(), 3 * time.Second, nil},
-		{0, time.Now(), 4 * time.Second, time.Now(), 3 * time.Second, nil},
-		{0, time.Now(), 3 * time.Second, time.Now(), 4 * time.Second, nil},
-		{0, time.Now().Add(-1 * time.Second), 1 * time.Second, time.Now(), 1 * time.Second, context.DeadlineExceeded},
-		{0, time.Now(), 1 * time.Second, time.Now().Add(-1 * time.Second), 1 * time.Second, context.DeadlineExceeded},
-		{0, time.Now().Add(-1 * time.Second), 1, time.Now().Add(-1 * time.Second), 1 * time.Second, context.DeadlineExceeded},
-		{1 * time.Second, time.Now(), 1 * time.Second, time.Now(), 1 * time.Second, context.DeadlineExceeded},
-		{1 * time.Second, time.Now(), 2 * time.Second, time.Now(), 1 * time.Second, context.DeadlineExceeded},
-		{1 * time.Second, time.Now(), 1 * time.Second, time.Now(), 2 * time.Second, context.DeadlineExceeded},
+		{0, time.Now(), 3 * time.Second, time.Now(), 3 * time.Second, "test", nil},
+		{0, time.Now(), 4 * time.Second, time.Now(), 3 * time.Second, "test", nil},
+		{0, time.Now(), 3 * time.Second, time.Now(), 4 * time.Second, "test", nil},
+		{0, time.Now(), 3 * time.Second, time.Now(), 4 * time.Second, "unknown", nil},
+		{0, time.Now().Add(-1 * time.Second), 1 * time.Second, time.Now(), 1 * time.Second, "test", context.DeadlineExceeded},
+		{0, time.Now(), 1 * time.Second, time.Now().Add(-1 * time.Second), 1 * time.Second, "test", context.DeadlineExceeded},
+		{0, time.Now().Add(-1 * time.Second), 1, time.Now().Add(-1 * time.Second), 1 * time.Second, "test", context.DeadlineExceeded},
+		{1 * time.Second, time.Now(), 1 * time.Second, time.Now(), 1 * time.Second, "test", context.DeadlineExceeded},
+		{1 * time.Second, time.Now(), 2 * time.Second, time.Now(), 1 * time.Second, "test", context.DeadlineExceeded},
+		{1 * time.Second, time.Now(), 1 * time.Second, time.Now(), 2 * time.Second, "test", context.DeadlineExceeded},
 	}
 	a := &testActivityDeadline{logger: t.logger}
 	registry := t.registry
@@ -1444,7 +1494,7 @@ func (t *TaskHandlersTestSuite) TestActivityExecutionDeadline() {
 			WorkflowExecution: &commonpb.WorkflowExecution{
 				WorkflowId: "wID",
 				RunId:      "rID"},
-			ActivityType:           &commonpb.ActivityType{Name: "test"},
+			ActivityType:           &commonpb.ActivityType{Name: d.ActivityType},
 			ActivityId:             uuid.New(),
 			ScheduledTime:          &d.ScheduleTS,
 			ScheduleToCloseTimeout: &d.ScheduleDuration,
@@ -1690,4 +1740,26 @@ func Test_IsSearchAttributesMatched(t *testing.T) {
 			require.Equal(t, testCase.expected, isSearchAttributesMatched(testCase.lhs, testCase.rhs))
 		})
 	}
+}
+
+func TestHeartbeatThrottleInterval(t *testing.T) {
+	assertInterval := func(timeoutSec, defaultIntervalSec, maxIntervalSec, expectedSec int) {
+		a := &activityTaskHandlerImpl{
+			defaultHeartbeatThrottleInterval: time.Duration(defaultIntervalSec) * time.Second,
+			maxHeartbeatThrottleInterval:     time.Duration(maxIntervalSec) * time.Second,
+		}
+		require.Equal(t, time.Duration(expectedSec)*time.Second,
+			a.getHeartbeatThrottleInterval(time.Duration(timeoutSec)*time.Second))
+	}
+
+	// Use 80% of timeout
+	assertInterval(5, 2, 10, 4)
+	// Use default if no timeout
+	assertInterval(0, 2, 10, 2)
+	// Use default of 30s if no timeout or default
+	assertInterval(0, 0, 50, 30)
+	// Use max if 80% of timeout is too large
+	assertInterval(14, 2, 10, 10)
+	// Default max to 60 if not set
+	assertInterval(5000, 2, 0, 60)
 }

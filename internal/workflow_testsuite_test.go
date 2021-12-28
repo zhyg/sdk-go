@@ -123,7 +123,7 @@ func TestUnregisteredActivity(t *testing.T) {
 	require.True(t, errors.As(err, &activityErr))
 
 	err = errors.Unwrap(activityErr)
-	var err1 *PanicError
+	var err1 *ApplicationError
 	require.True(t, errors.As(err, &err1))
 
 	require.True(t, strings.HasPrefix(err1.Error(), "unable to find activityType=unregistered"), err1.Error())
@@ -200,4 +200,27 @@ func TestLocalActivityExecutionByActivityNameAliasMissingRegistration(t *testing
 		return result, nil
 	}, "Hello")
 	require.NotNil(t, env.GetWorkflowError())
+}
+
+func TestWorkflowIDInsideTestWorkflow(t *testing.T) {
+	var suite WorkflowTestSuite
+	// Default ID
+	env := suite.NewTestWorkflowEnvironment()
+	env.ExecuteWorkflow(func(ctx Context) (string, error) {
+		return "id is: " + GetWorkflowInfo(ctx).WorkflowExecution.ID, nil
+	})
+	require.NoError(t, env.GetWorkflowError())
+	var str string
+	require.NoError(t, env.GetWorkflowResult(&str))
+	require.Equal(t, "id is: "+defaultTestWorkflowID, str)
+
+	// Custom ID
+	env = suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(StartWorkflowOptions{ID: "my-workflow-id"})
+	env.ExecuteWorkflow(func(ctx Context) (string, error) {
+		return "id is: " + GetWorkflowInfo(ctx).WorkflowExecution.ID, nil
+	})
+	require.NoError(t, env.GetWorkflowError())
+	require.NoError(t, env.GetWorkflowResult(&str))
+	require.Equal(t, "id is: my-workflow-id", str)
 }

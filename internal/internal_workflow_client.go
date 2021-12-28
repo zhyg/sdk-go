@@ -32,9 +32,7 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
 	"github.com/pborman/uuid"
-	"github.com/uber-go/tally"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
@@ -44,7 +42,6 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 
 	"go.temporal.io/sdk/converter"
-	"go.temporal.io/sdk/internal/common/backoff"
 	"go.temporal.io/sdk/internal/common/metrics"
 	"go.temporal.io/sdk/internal/common/serializer"
 	"go.temporal.io/sdk/internal/common/util"
@@ -71,18 +68,19 @@ type (
 		namespace          string
 		registry           *registry
 		logger             log.Logger
-		metricsScope       tally.Scope
+		metricsHandler     metrics.Handler
 		identity           string
 		dataConverter      converter.DataConverter
 		contextPropagators []ContextPropagator
-		tracer             opentracing.Tracer
+		workerInterceptors []WorkerInterceptor
+		interceptor        ClientOutboundInterceptor
 	}
 
 	// namespaceClient is the client for managing namespaces.
 	namespaceClient struct {
 		workflowService  workflowservice.WorkflowServiceClient
 		connectionCloser io.Closer
-		metricsScope     tally.Scope
+		metricsHandler   metrics.Handler
 		logger           log.Logger
 		identity         string
 	}
@@ -111,7 +109,7 @@ type (
 
 	// workflowRunImpl is an implementation of WorkflowRun
 	workflowRunImpl struct {
-		workflowFn    interface{}
+		workflowType  string
 		workflowID    string
 		firstRunID    string
 		currentRunID  *util.OnceCell
@@ -127,9 +125,10 @@ type (
 		HasNext() bool
 		// Next returns the next history events and error
 		// The errors it can return:
-		//	- EntityNotExistsError
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		Next() (*historypb.HistoryEvent, error)
 	}
 
@@ -149,104 +148,6 @@ type (
 	}
 )
 
-// StartWorkflow starts a workflow execution
-// The user can use this to start using a functor like.
-// Either by
-//     StartWorkflow(options, "workflowTypeName", arg1, arg2, arg3)
-//     or
-//     StartWorkflow(options, workflowExecuteFn, arg1, arg2, arg3)
-// The current timeout resolution implementation is in seconds and uses math.Ceil(d.Seconds()) as the duration. But is
-// subjected to change in the future.
-func (wc *WorkflowClient) StartWorkflow(
-	ctx context.Context,
-	options StartWorkflowOptions,
-	workflowFunc interface{},
-	args ...interface{},
-) (*WorkflowExecution, error) {
-	workflowID := options.ID
-	if len(workflowID) == 0 {
-		workflowID = uuid.NewRandom().String()
-	}
-
-	executionTimeout := options.WorkflowExecutionTimeout
-	runTimeout := options.WorkflowRunTimeout
-	workflowTaskTimeout := options.WorkflowTaskTimeout
-
-	dataConverter := WithContext(ctx, wc.dataConverter)
-	// Validate type and its arguments.
-	workflowType, input, err := getValidatedWorkflowFunction(workflowFunc, args, dataConverter, wc.registry)
-	if err != nil {
-		return nil, err
-	}
-
-	memo, err := getWorkflowMemo(options.Memo, wc.dataConverter)
-	if err != nil {
-		return nil, err
-	}
-
-	searchAttr, err := serializeSearchAttributes(options.SearchAttributes)
-	if err != nil {
-		return nil, err
-	}
-
-	// create a workflow start span and attach it to the context object.
-	// N.B. we need to finish this immediately as jaeger does not give us a way
-	// to recreate a span given a span context - which means we will run into
-	// issues during replay. we work around this by creating and ending the
-	// workflow start span and passing in that context to the workflow. So
-	// everything beginning with the StartWorkflowExecutionRequest will be
-	// parented by the created start workflow span.
-	ctx, span := createOpenTracingWorkflowSpan(ctx, wc.tracer, time.Now(), fmt.Sprintf("StartWorkflow-%s", workflowType.Name), workflowID)
-	span.Finish()
-
-	// get workflow headers from the context
-	header := wc.getWorkflowHeader(ctx)
-
-	// run propagators to extract information about tracing and other stuff, store in headers field
-	startRequest := &workflowservice.StartWorkflowExecutionRequest{
-		Namespace:                wc.namespace,
-		RequestId:                uuid.New(),
-		WorkflowId:               workflowID,
-		WorkflowType:             &commonpb.WorkflowType{Name: workflowType.Name},
-		TaskQueue:                &taskqueuepb.TaskQueue{Name: options.TaskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
-		Input:                    input,
-		WorkflowExecutionTimeout: &executionTimeout,
-		WorkflowRunTimeout:       &runTimeout,
-		WorkflowTaskTimeout:      &workflowTaskTimeout,
-		Identity:                 wc.identity,
-		WorkflowIdReusePolicy:    options.WorkflowIDReusePolicy,
-		RetryPolicy:              convertToPBRetryPolicy(options.RetryPolicy),
-		CronSchedule:             options.CronSchedule,
-		Memo:                     memo,
-		SearchAttributes:         searchAttr,
-		Header:                   header,
-	}
-
-	var response *workflowservice.StartWorkflowExecutionResponse
-
-	// Start creating workflow request.
-	err = backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx, grpcMetricsScope(
-				metrics.GetMetricsScopeForRPC(wc.metricsScope, workflowType.Name,
-					metrics.NoneTagValue, options.TaskQueue)))
-			defer cancel()
-
-			var err1 error
-			response, err1 = wc.workflowService.StartWorkflowExecution(grpcCtx, startRequest)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
-
-	if err != nil {
-		return nil, err
-	}
-
-	executionInfo := &WorkflowExecution{
-		ID:    workflowID,
-		RunID: response.GetRunId()}
-	return executionInfo, nil
-}
-
 // ExecuteWorkflow starts a workflow execution and returns a WorkflowRun that will allow you to wait until this workflow
 // reaches the end state, such as workflow finished successfully or timeout.
 // The user can use this to start using a functor like below and get the workflow execution result, as EncodedValue
@@ -258,41 +159,29 @@ func (wc *WorkflowClient) StartWorkflow(
 // subjected to change in the future.
 // NOTE: the context.Context should have a fairly large timeout, since workflow execution may take a while to be finished
 func (wc *WorkflowClient) ExecuteWorkflow(ctx context.Context, options StartWorkflowOptions, workflow interface{}, args ...interface{}) (WorkflowRun, error) {
-	// start the workflow execution
-	var runID string
-	var workflowID string
-	executionInfo, err := wc.StartWorkflow(ctx, options, workflow, args...)
+	// Default workflow ID
+	if options.ID == "" {
+		options.ID = uuid.New()
+	}
+
+	// Validate function and get name
+	if err := validateFunctionArgs(workflow, args, true); err != nil {
+		return nil, err
+	}
+	workflowType, err := getWorkflowFunctionName(wc.registry, workflow)
 	if err != nil {
-		if e, ok := err.(*serviceerror.WorkflowExecutionAlreadyStarted); ok {
-			if options.WorkflowExecutionErrorWhenAlreadyStarted {
-				return nil, err
-			}
-			runID = e.RunId
-			workflowID = options.ID
-		} else {
-			return nil, err
-		}
-	} else {
-		runID = executionInfo.RunID
-		workflowID = executionInfo.ID
+		return nil, err
 	}
 
-	iterFn := func(fnCtx context.Context, fnRunID string) HistoryEventIterator {
-		fnName, _ := getWorkflowFunctionName(wc.registry, workflow)
-		rpcScope := metrics.GetMetricsScopeForRPC(wc.metricsScope, fnName, metrics.NoneTagValue, options.TaskQueue)
-		return wc.getWorkflowHistory(fnCtx, workflowID, fnRunID, true, enumspb.HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT, rpcScope)
-	}
+	// Set header before interceptor run
+	ctx = contextWithNewHeader(ctx)
 
-	curRunIDCell := util.PopulatedOnceCell(runID)
-	return &workflowRunImpl{
-		workflowFn:    workflow,
-		workflowID:    workflowID,
-		firstRunID:    runID,
-		currentRunID:  &curRunIDCell,
-		iterFn:        iterFn,
-		dataConverter: wc.dataConverter,
-		registry:      wc.registry,
-	}, nil
+	// Run via interceptor
+	return wc.interceptor.ExecuteWorkflow(ctx, &ClientExecuteWorkflowInput{
+		Options:      &options,
+		WorkflowType: workflowType,
+		Args:         args,
+	})
 }
 
 // GetWorkflow gets a workflow execution and returns a WorkflowRun that will allow you to wait until this workflow
@@ -300,7 +189,6 @@ func (wc *WorkflowClient) ExecuteWorkflow(ctx context.Context, options StartWork
 // The current timeout resolution implementation is in seconds and uses math.Ceil(d.Seconds()) as the duration. But is
 // subjected to change in the future.
 func (wc *WorkflowClient) GetWorkflow(ctx context.Context, workflowID string, runID string) WorkflowRun {
-
 	iterFn := func(fnCtx context.Context, fnRunID string) HistoryEventIterator {
 		return wc.GetWorkflowHistory(fnCtx, workflowID, fnRunID, true, enumspb.HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT)
 	}
@@ -339,29 +227,15 @@ func (wc *WorkflowClient) GetWorkflow(ctx context.Context, workflowID string, ru
 
 // SignalWorkflow signals a workflow in execution.
 func (wc *WorkflowClient) SignalWorkflow(ctx context.Context, workflowID string, runID string, signalName string, arg interface{}) error {
-	input, err := encodeArg(wc.dataConverter, arg)
-	if err != nil {
-		return err
-	}
+	// Set header before interceptor run
+	ctx = contextWithNewHeader(ctx)
 
-	request := &workflowservice.SignalWorkflowExecutionRequest{
-		Namespace: wc.namespace,
-		WorkflowExecution: &commonpb.WorkflowExecution{
-			WorkflowId: workflowID,
-			RunId:      runID,
-		},
+	return wc.interceptor.SignalWorkflow(ctx, &ClientSignalWorkflowInput{
+		WorkflowID: workflowID,
+		RunID:      runID,
 		SignalName: signalName,
-		Input:      input,
-		Identity:   wc.identity,
-	}
-
-	return backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			_, err := wc.workflowService.SignalWorkflowExecution(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+		Arg:        arg,
+	})
 }
 
 // SignalWithStartWorkflow sends a signal to a running workflow.
@@ -369,148 +243,57 @@ func (wc *WorkflowClient) SignalWorkflow(ctx context.Context, workflowID string,
 func (wc *WorkflowClient) SignalWithStartWorkflow(ctx context.Context, workflowID string, signalName string, signalArg interface{},
 	options StartWorkflowOptions, workflowFunc interface{}, workflowArgs ...interface{}) (WorkflowRun, error) {
 
-	signalInput, err := encodeArg(wc.dataConverter, signalArg)
+	// Due to the ambiguous way to provide workflow IDs, if options contains an
+	// ID, it must match the parameter
+	if options.ID != "" && options.ID != workflowID {
+		return nil, fmt.Errorf("workflow ID from options not used, must be unset or match workflow ID parameter")
+	}
+
+	// Default workflow ID to UUID
+	options.ID = workflowID
+	if options.ID == "" {
+		options.ID = uuid.New()
+	}
+
+	// Validate function and get name
+	if err := validateFunctionArgs(workflowFunc, workflowArgs, true); err != nil {
+		return nil, err
+	}
+	workflowType, err := getWorkflowFunctionName(wc.registry, workflowFunc)
 	if err != nil {
 		return nil, err
 	}
 
-	if workflowID == "" {
-		workflowID = uuid.NewRandom().String()
-	}
+	// Set header before interceptor run
+	ctx = contextWithNewHeader(ctx)
 
-	executionTimeout := options.WorkflowExecutionTimeout
-	runTimeout := options.WorkflowRunTimeout
-	taskTimeout := options.WorkflowTaskTimeout
-
-	// Validate type and its arguments.
-	workflowType, input, err := getValidatedWorkflowFunction(workflowFunc, workflowArgs, wc.dataConverter, wc.registry)
-	if err != nil {
-		return nil, err
-	}
-
-	memo, err := getWorkflowMemo(options.Memo, wc.dataConverter)
-	if err != nil {
-		return nil, err
-	}
-
-	searchAttr, err := serializeSearchAttributes(options.SearchAttributes)
-	if err != nil {
-		return nil, err
-	}
-
-	// create a workflow start span and attach it to the context object. finish it immediately
-	ctx, span := createOpenTracingWorkflowSpan(ctx, wc.tracer, time.Now(), fmt.Sprintf("SignalWithStartWorkflow-%s", workflowType.Name), workflowID)
-	span.Finish()
-
-	// get workflow headers from the context
-	header := wc.getWorkflowHeader(ctx)
-
-	signalWithStartRequest := &workflowservice.SignalWithStartWorkflowExecutionRequest{
-		Namespace:                wc.namespace,
-		RequestId:                uuid.New(),
-		WorkflowId:               workflowID,
-		WorkflowType:             &commonpb.WorkflowType{Name: workflowType.Name},
-		TaskQueue:                &taskqueuepb.TaskQueue{Name: options.TaskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
-		Input:                    input,
-		WorkflowExecutionTimeout: &executionTimeout,
-		WorkflowRunTimeout:       &runTimeout,
-		WorkflowTaskTimeout:      &taskTimeout,
-		SignalName:               signalName,
-		SignalInput:              signalInput,
-		Identity:                 wc.identity,
-		RetryPolicy:              convertToPBRetryPolicy(options.RetryPolicy),
-		CronSchedule:             options.CronSchedule,
-		Memo:                     memo,
-		SearchAttributes:         searchAttr,
-		WorkflowIdReusePolicy:    options.WorkflowIDReusePolicy,
-		Header:                   header,
-	}
-
-	var response *workflowservice.SignalWithStartWorkflowExecutionResponse
-
-	// Start creating workflow request.
-	err = backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-
-			var err1 error
-			response, err1 = wc.workflowService.SignalWithStartWorkflowExecution(grpcCtx, signalWithStartRequest)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
-
-	if err != nil {
-		return nil, err
-	}
-
-	iterFn := func(fnCtx context.Context, fnRunID string) HistoryEventIterator {
-		rpcScope := metrics.GetMetricsScopeForRPC(wc.metricsScope, workflowType.Name, metrics.NoneTagValue, options.TaskQueue)
-		return wc.getWorkflowHistory(fnCtx, workflowID, fnRunID, true, enumspb.HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT, rpcScope)
-	}
-
-	curRunIDCell := util.PopulatedOnceCell(response.GetRunId())
-	return &workflowRunImpl{
-		workflowFn:    workflowFunc,
-		workflowID:    workflowID,
-		firstRunID:    response.GetRunId(),
-		currentRunID:  &curRunIDCell,
-		iterFn:        iterFn,
-		dataConverter: wc.dataConverter,
-		registry:      wc.registry,
-	}, nil
+	// Run via interceptor
+	return wc.interceptor.SignalWithStartWorkflow(ctx, &ClientSignalWithStartWorkflowInput{
+		SignalName:   signalName,
+		SignalArg:    signalArg,
+		Options:      &options,
+		WorkflowType: workflowType,
+		Args:         workflowArgs,
+	})
 }
 
 // CancelWorkflow cancels a workflow in execution.  It allows workflow to properly clean up and gracefully close.
 // workflowID is required, other parameters are optional.
 // If runID is omit, it will terminate currently running workflow (if there is one) based on the workflowID.
 func (wc *WorkflowClient) CancelWorkflow(ctx context.Context, workflowID string, runID string) error {
-	request := &workflowservice.RequestCancelWorkflowExecutionRequest{
-		Namespace: wc.namespace,
-		WorkflowExecution: &commonpb.WorkflowExecution{
-			WorkflowId: workflowID,
-			RunId:      runID,
-		},
-		Identity: wc.identity,
-	}
-
-	return backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			_, err := wc.workflowService.RequestCancelWorkflowExecution(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	return wc.interceptor.CancelWorkflow(ctx, &ClientCancelWorkflowInput{WorkflowID: workflowID, RunID: runID})
 }
 
 // TerminateWorkflow terminates a workflow execution.
 // workflowID is required, other parameters are optional.
 // If runID is omit, it will terminate currently running workflow (if there is one) based on the workflowID.
 func (wc *WorkflowClient) TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string, details ...interface{}) error {
-	datailsPayload, err := wc.dataConverter.ToPayloads(details...)
-	if err != nil {
-		return err
-	}
-
-	request := &workflowservice.TerminateWorkflowExecutionRequest{
-		Namespace: wc.namespace,
-		WorkflowExecution: &commonpb.WorkflowExecution{
-			WorkflowId: workflowID,
-			RunId:      runID,
-		},
-		Reason:   reason,
-		Identity: wc.identity,
-		Details:  datailsPayload,
-	}
-
-	err = backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			_, err := wc.workflowService.TerminateWorkflowExecution(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
-
-	return err
+	return wc.interceptor.TerminateWorkflow(ctx, &ClientTerminateWorkflowInput{
+		WorkflowID: workflowID,
+		RunID:      runID,
+		Reason:     reason,
+		Details:    details,
+	})
 }
 
 // GetWorkflowHistory return a channel which contains the history events of a given workflow
@@ -521,7 +304,7 @@ func (wc *WorkflowClient) GetWorkflowHistory(
 	isLongPoll bool,
 	filterType enumspb.HistoryEventFilterType,
 ) HistoryEventIterator {
-	return wc.getWorkflowHistory(ctx, workflowID, runID, isLongPoll, filterType, wc.metricsScope)
+	return wc.getWorkflowHistory(ctx, workflowID, runID, isLongPoll, filterType, wc.metricsHandler)
 }
 
 func (wc *WorkflowClient) getWorkflowHistory(
@@ -530,7 +313,7 @@ func (wc *WorkflowClient) getWorkflowHistory(
 	runID string,
 	isLongPoll bool,
 	filterType enumspb.HistoryEventFilterType,
-	rpcMetricsScope tally.Scope,
+	rpcMetricsHandler metrics.Handler,
 ) HistoryEventIterator {
 	namespace := wc.namespace
 	paginate := func(nextToken []byte) (*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
@@ -550,39 +333,7 @@ func (wc *WorkflowClient) getWorkflowHistory(
 		var err error
 	Loop:
 		for {
-			err = backoff.Retry(ctx,
-				func() error {
-					var err1 error
-					grpcCtx, cancel := newGRPCContext(ctx,
-						grpcMetricsScope(rpcMetricsScope),
-						grpcLongPoll(isLongPoll),
-						func(builder *grpcContextBuilder) {
-							if isLongPoll {
-								builder.Timeout = defaultGetHistoryTimeout
-							}
-						})
-					defer cancel()
-					response, err1 = wc.workflowService.GetWorkflowExecutionHistory(grpcCtx, request)
-
-					if err1 != nil {
-						return err1
-					}
-
-					if response.RawHistory != nil {
-						history, err := serializer.DeserializeBlobDataToHistoryEvents(response.RawHistory, filterType)
-						if err != nil {
-							return err
-						}
-						response.History = history
-					}
-					return err1
-				},
-				createDynamicServiceRetryPolicy(ctx),
-				func(err error) bool {
-					return isServiceTransientError(err) || isEntityNotFoundFromPassive(err)
-				},
-			)
-
+			response, err = wc.getWorkflowExecutionHistory(ctx, rpcMetricsHandler, isLongPoll, request, filterType)
 			if err != nil {
 				return nil, err
 			}
@@ -600,14 +351,29 @@ func (wc *WorkflowClient) getWorkflowHistory(
 	}
 }
 
-func isEntityNotFoundFromPassive(err error) bool {
-	if notFoundError, ok := err.(*serviceerror.NotFound); ok {
-		return notFoundError.ActiveCluster != "" &&
-			notFoundError.CurrentCluster != "" &&
-			notFoundError.ActiveCluster != notFoundError.CurrentCluster
+func (wc *WorkflowClient) getWorkflowExecutionHistory(ctx context.Context, rpcMetricsHandler metrics.Handler, isLongPoll bool,
+	request *workflowservice.GetWorkflowExecutionHistoryRequest, filterType enumspb.HistoryEventFilterType) (*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
+	grpcCtx, cancel := newGRPCContext(ctx, grpcMetricsHandler(rpcMetricsHandler), grpcLongPoll(isLongPoll), defaultGrpcRetryParameters(ctx), func(builder *grpcContextBuilder) {
+		if isLongPoll {
+			builder.Timeout = defaultGetHistoryTimeout
+		}
+	})
+
+	defer cancel()
+	response, err := wc.workflowService.GetWorkflowExecutionHistory(grpcCtx, request)
+
+	if err != nil {
+		return nil, err
 	}
 
-	return false
+	if response.RawHistory != nil {
+		history, err := serializer.DeserializeBlobDataToHistoryEvents(response.RawHistory, filterType)
+		if err != nil {
+			return nil, err
+		}
+		response.History = history
+	}
+	return response, err
 }
 
 // CompleteActivity reports activity completed. activity Execute method can return activity.ErrResultPending to
@@ -620,16 +386,17 @@ func (wc *WorkflowClient) CompleteActivity(ctx context.Context, taskToken []byte
 		return errors.New("invalid task token provided")
 	}
 
+	dataConverter := WithContext(ctx, wc.dataConverter)
 	var data *commonpb.Payloads
 	if result != nil {
 		var err0 error
-		data, err0 = encodeArg(wc.dataConverter, result)
+		data, err0 = encodeArg(dataConverter, result)
 		if err0 != nil {
 			return err0
 		}
 	}
 	request := convertActivityResultToRespondRequest(wc.identity, taskToken, data, err, wc.dataConverter, wc.namespace)
-	return reportActivityComplete(ctx, wc.workflowService, request, wc.metricsScope)
+	return reportActivityComplete(ctx, wc.workflowService, request, wc.metricsHandler)
 }
 
 // CompleteActivityByID reports activity completed. Similar to CompleteActivity
@@ -641,56 +408,54 @@ func (wc *WorkflowClient) CompleteActivityByID(ctx context.Context, namespace, w
 		return errors.New("empty activity or workflow id or namespace")
 	}
 
+	dataConverter := WithContext(ctx, wc.dataConverter)
 	var data *commonpb.Payloads
 	if result != nil {
 		var err0 error
-		data, err0 = encodeArg(wc.dataConverter, result)
+		data, err0 = encodeArg(dataConverter, result)
 		if err0 != nil {
 			return err0
 		}
 	}
 
 	request := convertActivityResultToRespondRequestByID(wc.identity, namespace, workflowID, runID, activityID, data, err, wc.dataConverter)
-	return reportActivityCompleteByID(ctx, wc.workflowService, request, wc.metricsScope)
+	return reportActivityCompleteByID(ctx, wc.workflowService, request, wc.metricsHandler)
 }
 
 // RecordActivityHeartbeat records heartbeat for an activity.
 func (wc *WorkflowClient) RecordActivityHeartbeat(ctx context.Context, taskToken []byte, details ...interface{}) error {
-	data, err := encodeArgs(wc.dataConverter, details)
+	dataConverter := WithContext(ctx, wc.dataConverter)
+	data, err := encodeArgs(dataConverter, details)
 	if err != nil {
 		return err
 	}
-	return recordActivityHeartbeat(ctx, wc.workflowService, wc.metricsScope, wc.identity, taskToken, data)
+	return recordActivityHeartbeat(ctx, wc.workflowService, wc.metricsHandler, wc.identity, taskToken, data)
 }
 
 // RecordActivityHeartbeatByID records heartbeat for an activity.
 func (wc *WorkflowClient) RecordActivityHeartbeatByID(ctx context.Context,
 	namespace, workflowID, runID, activityID string, details ...interface{}) error {
-	data, err := encodeArgs(wc.dataConverter, details)
+	dataConverter := WithContext(ctx, wc.dataConverter)
+	data, err := encodeArgs(dataConverter, details)
 	if err != nil {
 		return err
 	}
-	return recordActivityHeartbeatByID(ctx, wc.workflowService, wc.metricsScope, wc.identity, namespace, workflowID, runID, activityID, data)
+	return recordActivityHeartbeatByID(ctx, wc.workflowService, wc.metricsHandler, wc.identity, namespace, workflowID, runID, activityID, data)
 }
 
 // ListClosedWorkflow gets closed workflow executions based on request filters
 // The errors it can throw:
-//  - BadRequestError
-//  - InternalServiceError
-//  - EntityNotExistError
+//  - serviceerror.InvalidArgument
+//  - serviceerror.Internal
+//  - serviceerror.Unavailable
+//  - serviceerror.NotFound
 func (wc *WorkflowClient) ListClosedWorkflow(ctx context.Context, request *workflowservice.ListClosedWorkflowExecutionsRequest) (*workflowservice.ListClosedWorkflowExecutionsResponse, error) {
 	if request.GetNamespace() == "" {
 		request.Namespace = wc.namespace
 	}
-	var response *workflowservice.ListClosedWorkflowExecutionsResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.ListClosedWorkflowExecutions(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.ListClosedWorkflowExecutions(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -699,22 +464,17 @@ func (wc *WorkflowClient) ListClosedWorkflow(ctx context.Context, request *workf
 
 // ListOpenWorkflow gets open workflow executions based on request filters
 // The errors it can throw:
-//  - BadRequestError
-//  - InternalServiceError
-//  - EntityNotExistError
+//  - serviceerror.InvalidArgument
+//  - serviceerror.Internal
+//  - serviceerror.Unavailable
+//  - serviceerror.NotFound
 func (wc *WorkflowClient) ListOpenWorkflow(ctx context.Context, request *workflowservice.ListOpenWorkflowExecutionsRequest) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {
 	if request.GetNamespace() == "" {
 		request.Namespace = wc.namespace
 	}
-	var response *workflowservice.ListOpenWorkflowExecutionsResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.ListOpenWorkflowExecutions(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.ListOpenWorkflowExecutions(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -726,15 +486,9 @@ func (wc *WorkflowClient) ListWorkflow(ctx context.Context, request *workflowser
 	if request.GetNamespace() == "" {
 		request.Namespace = wc.namespace
 	}
-	var response *workflowservice.ListWorkflowExecutionsResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.ListWorkflowExecutions(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.ListWorkflowExecutions(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -746,27 +500,21 @@ func (wc *WorkflowClient) ListArchivedWorkflow(ctx context.Context, request *wor
 	if request.GetNamespace() == "" {
 		request.Namespace = wc.namespace
 	}
-	var response *workflowservice.ListArchivedWorkflowExecutionsResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			timeout := maxListArchivedWorkflowTimeout
-			now := time.Now()
-			if ctx != nil {
-				if expiration, ok := ctx.Deadline(); ok && expiration.After(now) {
-					timeout = expiration.Sub(now)
-					if timeout > maxListArchivedWorkflowTimeout {
-						timeout = maxListArchivedWorkflowTimeout
-					} else if timeout < minRPCTimeout {
-						timeout = minRPCTimeout
-					}
-				}
+	timeout := maxListArchivedWorkflowTimeout
+	now := time.Now()
+	if ctx != nil {
+		if expiration, ok := ctx.Deadline(); ok && expiration.After(now) {
+			timeout = expiration.Sub(now)
+			if timeout > maxListArchivedWorkflowTimeout {
+				timeout = maxListArchivedWorkflowTimeout
+			} else if timeout < minRPCTimeout {
+				timeout = minRPCTimeout
 			}
-			grpcCtx, cancel := newGRPCContext(ctx, grpcTimeout(timeout))
-			defer cancel()
-			response, err1 = wc.workflowService.ListArchivedWorkflowExecutions(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+		}
+	}
+	grpcCtx, cancel := newGRPCContext(ctx, grpcTimeout(timeout), defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.ListArchivedWorkflowExecutions(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -778,15 +526,9 @@ func (wc *WorkflowClient) ScanWorkflow(ctx context.Context, request *workflowser
 	if request.GetNamespace() == "" {
 		request.Namespace = wc.namespace
 	}
-	var response *workflowservice.ScanWorkflowExecutionsResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.ScanWorkflowExecutions(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.ScanWorkflowExecutions(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -798,15 +540,9 @@ func (wc *WorkflowClient) CountWorkflow(ctx context.Context, request *workflowse
 	if request.GetNamespace() == "" {
 		request.Namespace = wc.namespace
 	}
-	var response *workflowservice.CountWorkflowExecutionsResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.CountWorkflowExecutions(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.CountWorkflowExecutions(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -815,15 +551,9 @@ func (wc *WorkflowClient) CountWorkflow(ctx context.Context, request *workflowse
 
 // GetSearchAttributes implementation
 func (wc *WorkflowClient) GetSearchAttributes(ctx context.Context) (*workflowservice.GetSearchAttributesResponse, error) {
-	var response *workflowservice.GetSearchAttributesResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.GetSearchAttributes(grpcCtx, &workflowservice.GetSearchAttributesRequest{})
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.GetSearchAttributes(grpcCtx, &workflowservice.GetSearchAttributesRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -832,9 +562,10 @@ func (wc *WorkflowClient) GetSearchAttributes(ctx context.Context) (*workflowser
 
 // DescribeWorkflowExecution returns information about the specified workflow execution.
 // The errors it can return:
-//  - BadRequestError
-//  - InternalServiceError
-//  - EntityNotExistError
+//  - serviceerror.InvalidArgument
+//  - serviceerror.Internal
+//  - serviceerror.Unavailable
+//  - serviceerror.NotFound
 func (wc *WorkflowClient) DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
 	request := &workflowservice.DescribeWorkflowExecutionRequest{
 		Namespace: wc.namespace,
@@ -843,15 +574,9 @@ func (wc *WorkflowClient) DescribeWorkflowExecution(ctx context.Context, workflo
 			RunId:      runID,
 		},
 	}
-	var response *workflowservice.DescribeWorkflowExecutionResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			var err1 error
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			response, err1 = wc.workflowService.DescribeWorkflowExecution(grpcCtx, request)
-			return err1
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := wc.workflowService.DescribeWorkflowExecution(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -866,22 +591,21 @@ func (wc *WorkflowClient) DescribeWorkflowExecution(ctx context.Context, workflo
 // - queryType is the type of the query.
 // - args... are the optional query parameters.
 // The errors it can return:
-//  - BadRequestError
-//  - InternalServiceError
-//  - EntityNotExistError
-//  - QueryFailError
+//  - serviceerror.InvalidArgument
+//  - serviceerror.Internal
+//  - serviceerror.Unavailable
+//  - serviceerror.NotFound
+//  - serviceerror.QueryFailed
 func (wc *WorkflowClient) QueryWorkflow(ctx context.Context, workflowID string, runID string, queryType string, args ...interface{}) (converter.EncodedValue, error) {
-	queryWorkflowWithOptionsRequest := &QueryWorkflowWithOptionsRequest{
+	// Set header before interceptor run
+	ctx = contextWithNewHeader(ctx)
+
+	return wc.interceptor.QueryWorkflow(ctx, &ClientQueryWorkflowInput{
 		WorkflowID: workflowID,
 		RunID:      runID,
 		QueryType:  queryType,
 		Args:       args,
-	}
-	result, err := wc.QueryWorkflowWithOptions(ctx, queryWorkflowWithOptionsRequest)
-	if err != nil {
-		return nil, err
-	}
-	return result.QueryResult, nil
+	})
 }
 
 // QueryWorkflowWithOptionsRequest is the request to QueryWorkflowWithOptions
@@ -907,6 +631,9 @@ type QueryWorkflowWithOptionsRequest struct {
 	// QUERY_REJECT_CONDITION_NOT_OPEN indicates that query should be rejected if workflow is not open.
 	// QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY indicates that query should be rejected if workflow did not complete cleanly (e.g. terminated, canceled timeout etc...).
 	QueryRejectCondition enumspb.QueryRejectCondition
+
+	// Header is an optional header to include with the query.
+	Header *commonpb.Header
 }
 
 // QueryWorkflowWithOptionsResponse is the response to QueryWorkflowWithOptions
@@ -922,10 +649,11 @@ type QueryWorkflowWithOptionsResponse struct {
 // QueryWorkflowWithOptions queries a given workflow execution and returns the query result synchronously.
 // See QueryWorkflowWithOptionsRequest and QueryWorkflowWithOptionsResult for more information.
 // The errors it can return:
-//  - BadRequestError
-//  - InternalServiceError
-//  - EntityNotExistError
-//  - QueryFailError
+//  - serviceerror.InvalidArgument
+//  - serviceerror.Internal
+//  - serviceerror.Unavailable
+//  - serviceerror.NotFound
+//  - serviceerror.QueryFailed
 func (wc *WorkflowClient) QueryWorkflowWithOptions(ctx context.Context, request *QueryWorkflowWithOptionsRequest) (*QueryWorkflowWithOptionsResponse, error) {
 	var input *commonpb.Payloads
 	if len(request.Args) > 0 {
@@ -943,19 +671,14 @@ func (wc *WorkflowClient) QueryWorkflowWithOptions(ctx context.Context, request 
 		Query: &querypb.WorkflowQuery{
 			QueryType: request.QueryType,
 			QueryArgs: input,
+			Header:    request.Header,
 		},
 		QueryRejectCondition: request.QueryRejectCondition,
 	}
 
-	var resp *workflowservice.QueryWorkflowResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			var err error
-			resp, err = wc.workflowService.QueryWorkflow(grpcCtx, req)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	resp, err := wc.workflowService.QueryWorkflow(grpcCtx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -977,9 +700,10 @@ func (wc *WorkflowClient) QueryWorkflowWithOptions(ctx context.Context, request 
 // - taskqueue name of taskqueue
 // - taskqueueType type of taskqueue, can be workflow or activity
 // The errors it can return:
-//  - BadRequestError
-//  - InternalServiceError
-//  - EntityNotExistError
+//  - serviceerror.InvalidArgument
+//  - serviceerror.Internal
+//  - serviceerror.Unavailable
+//  - serviceerror.NotFound
 func (wc *WorkflowClient) DescribeTaskQueue(ctx context.Context, taskQueue string, taskQueueType enumspb.TaskQueueType) (*workflowservice.DescribeTaskQueueResponse, error) {
 	request := &workflowservice.DescribeTaskQueueRequest{
 		Namespace:     wc.namespace,
@@ -987,15 +711,9 @@ func (wc *WorkflowClient) DescribeTaskQueue(ctx context.Context, taskQueue strin
 		TaskQueueType: taskQueueType,
 	}
 
-	var resp *workflowservice.DescribeTaskQueueResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			var err error
-			resp, err = wc.workflowService.DescribeTaskQueue(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	resp, err := wc.workflowService.DescribeTaskQueue(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -1011,20 +729,19 @@ func (wc *WorkflowClient) ResetWorkflowExecution(ctx context.Context, request *w
 		request.RequestId = uuid.New()
 	}
 
-	var resp *workflowservice.ResetWorkflowExecutionResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			var err error
-			resp, err = wc.workflowService.ResetWorkflowExecution(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	resp, err := wc.workflowService.ResetWorkflowExecution(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
 
 	return resp, nil
+}
+
+// WorkflowService implements Client.WorkflowService.
+func (wc *WorkflowClient) WorkflowService() workflowservice.WorkflowServiceClient {
+	return wc.workflowService
 }
 
 // Close client and clean up underlying resources.
@@ -1037,31 +754,18 @@ func (wc *WorkflowClient) Close() {
 	}
 }
 
-func (wc *WorkflowClient) getWorkflowHeader(ctx context.Context) *commonpb.Header {
-	header := &commonpb.Header{
-		Fields: make(map[string]*commonpb.Payload),
-	}
-	writer := NewHeaderWriter(header)
-	for _, ctxProp := range wc.contextPropagators {
-		_ = ctxProp.Inject(ctx, writer)
-	}
-	return header
-}
-
 // Register a namespace with temporal server
 // The errors it can throw:
 //	- NamespaceAlreadyExistsError
-//	- BadRequestError
-//	- InternalServiceError
+//	- serviceerror.InvalidArgument
+//	- serviceerror.Internal
+//	- serviceerror.Unavailable
 func (nc *namespaceClient) Register(ctx context.Context, request *workflowservice.RegisterNamespaceRequest) error {
-	return backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			var err error
-			_, err = nc.workflowService.RegisterNamespace(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	var err error
+	_, err = nc.workflowService.RegisterNamespace(grpcCtx, request)
+	return err
 }
 
 // Describe a namespace. The namespace has 3 part of information
@@ -1069,23 +773,18 @@ func (nc *namespaceClient) Register(ctx context.Context, request *workflowservic
 // NamespaceConfiguration - Configuration like Workflow Execution Retention Period In Days, Whether to emit metrics.
 // ReplicationConfiguration - replication config like clusters and active cluster name
 // The errors it can throw:
-//	- EntityNotExistsError
-//	- BadRequestError
-//	- InternalServiceError
+//	- serviceerror.NotFound
+//	- serviceerror.InvalidArgument
+//	- serviceerror.Internal
+//	- serviceerror.Unavailable
 func (nc *namespaceClient) Describe(ctx context.Context, namespace string) (*workflowservice.DescribeNamespaceResponse, error) {
 	request := &workflowservice.DescribeNamespaceRequest{
 		Namespace: namespace,
 	}
 
-	var response *workflowservice.DescribeNamespaceResponse
-	err := backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			var err error
-			response, err = nc.workflowService.DescribeNamespace(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	response, err := nc.workflowService.DescribeNamespace(grpcCtx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -1094,17 +793,15 @@ func (nc *namespaceClient) Describe(ctx context.Context, namespace string) (*wor
 
 // Update a namespace.
 // The errors it can throw:
-//	- EntityNotExistsError
-//	- BadRequestError
-//	- InternalServiceError
+//	- serviceerror.NotFound
+//	- serviceerror.InvalidArgument
+//	- serviceerror.Internal
+//	- serviceerror.Unavailable
 func (nc *namespaceClient) Update(ctx context.Context, request *workflowservice.UpdateNamespaceRequest) error {
-	return backoff.Retry(ctx,
-		func() error {
-			grpcCtx, cancel := newGRPCContext(ctx)
-			defer cancel()
-			_, err := nc.workflowService.UpdateNamespace(grpcCtx, request)
-			return err
-		}, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	_, err := nc.workflowService.UpdateNamespace(grpcCtx, request)
+	return err
 }
 
 // Close client and clean up underlying resources.
@@ -1186,6 +883,9 @@ func (workflowRun *workflowRunImpl) Get(ctx context.Context, valuePtr interface{
 	switch closeEvent.GetEventType() {
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
 		attributes := closeEvent.GetWorkflowExecutionCompletedEventAttributes()
+		if attributes.NewExecutionRunId != "" {
+			return workflowRun.follow(ctx, valuePtr, attributes.NewExecutionRunId)
+		}
 		if valuePtr == nil || attributes.Result == nil {
 			return nil
 		}
@@ -1196,6 +896,9 @@ func (workflowRun *workflowRunImpl) Get(ctx context.Context, valuePtr interface{
 		return workflowRun.dataConverter.FromPayloads(attributes.Result, valuePtr)
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
 		attributes := closeEvent.GetWorkflowExecutionFailedEventAttributes()
+		if attributes.NewExecutionRunId != "" {
+			return workflowRun.follow(ctx, valuePtr, attributes.NewExecutionRunId)
+		}
 		err = ConvertFailureToError(attributes.GetFailure(), workflowRun.dataConverter)
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED:
 		attributes := closeEvent.GetWorkflowExecutionCanceledEventAttributes()
@@ -1204,24 +907,35 @@ func (workflowRun *workflowRunImpl) Get(ctx context.Context, valuePtr interface{
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED:
 		err = newTerminatedError()
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT:
+		attributes := closeEvent.GetWorkflowExecutionTimedOutEventAttributes()
+		if attributes.NewExecutionRunId != "" {
+			return workflowRun.follow(ctx, valuePtr, attributes.NewExecutionRunId)
+		}
 		err = NewTimeoutError("Workflow timeout", enumspb.TIMEOUT_TYPE_START_TO_CLOSE, nil)
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW:
 		attributes := closeEvent.GetWorkflowExecutionContinuedAsNewEventAttributes()
-		curRunID := util.PopulatedOnceCell(attributes.GetNewExecutionRunId())
-		workflowRun.currentRunID = &curRunID
-		return workflowRun.Get(ctx, valuePtr)
+		return workflowRun.follow(ctx, valuePtr, attributes.NewExecutionRunId)
 	default:
 		return fmt.Errorf("unexpected event type %s when handling workflow execution result", closeEvent.GetEventType())
 	}
 
-	fnName, _ := getWorkflowFunctionName(workflowRun.registry, workflowRun.workflowFn)
 	err = NewWorkflowExecutionError(
 		workflowRun.workflowID,
 		workflowRun.currentRunID.Get(),
-		fnName,
+		workflowRun.workflowType,
 		err)
 
 	return err
+}
+
+// follow is used by Get to follow a chain of executions linked by NewExecutionRunId, so that Get
+// doesn't return until the chain finishes. These can be ContinuedAsNew events, Completed events
+// (for workflows with a cron schedule), or Failed or TimedOut events (for workflows with a retry
+// policy or cron schedule).
+func (workflowRun *workflowRunImpl) follow(ctx context.Context, valuePtr interface{}, newRunID string) error {
+	curRunID := util.PopulatedOnceCell(newRunID)
+	workflowRun.currentRunID = &curRunID
+	return workflowRun.Get(ctx, valuePtr)
 }
 
 func getWorkflowMemo(input map[string]interface{}, dc converter.DataConverter) (*commonpb.Memo, error) {
@@ -1256,3 +970,289 @@ func serializeSearchAttributes(input map[string]interface{}) (*commonpb.SearchAt
 	}
 	return &commonpb.SearchAttributes{IndexedFields: attr}, nil
 }
+
+type workflowClientInterceptor struct{ client *WorkflowClient }
+
+func (w *workflowClientInterceptor) ExecuteWorkflow(
+	ctx context.Context,
+	in *ClientExecuteWorkflowInput,
+) (WorkflowRun, error) {
+	// This is always set before interceptor is invoked
+	workflowID := in.Options.ID
+	if workflowID == "" {
+		return nil, fmt.Errorf("no workflow ID in options")
+	}
+
+	executionTimeout := in.Options.WorkflowExecutionTimeout
+	runTimeout := in.Options.WorkflowRunTimeout
+	workflowTaskTimeout := in.Options.WorkflowTaskTimeout
+
+	dataConverter := WithContext(ctx, w.client.dataConverter)
+	if dataConverter == nil {
+		dataConverter = converter.GetDefaultDataConverter()
+	}
+
+	// Encode input
+	input, err := encodeArgs(dataConverter, in.Args)
+	if err != nil {
+		return nil, err
+	}
+
+	memo, err := getWorkflowMemo(in.Options.Memo, dataConverter)
+	if err != nil {
+		return nil, err
+	}
+
+	searchAttr, err := serializeSearchAttributes(in.Options.SearchAttributes)
+	if err != nil {
+		return nil, err
+	}
+
+	// get workflow headers from the context
+	header, err := headerPropagated(ctx, w.client.contextPropagators)
+	if err != nil {
+		return nil, err
+	}
+
+	// run propagators to extract information about tracing and other stuff, store in headers field
+	startRequest := &workflowservice.StartWorkflowExecutionRequest{
+		Namespace:                w.client.namespace,
+		RequestId:                uuid.New(),
+		WorkflowId:               workflowID,
+		WorkflowType:             &commonpb.WorkflowType{Name: in.WorkflowType},
+		TaskQueue:                &taskqueuepb.TaskQueue{Name: in.Options.TaskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		Input:                    input,
+		WorkflowExecutionTimeout: &executionTimeout,
+		WorkflowRunTimeout:       &runTimeout,
+		WorkflowTaskTimeout:      &workflowTaskTimeout,
+		Identity:                 w.client.identity,
+		WorkflowIdReusePolicy:    in.Options.WorkflowIDReusePolicy,
+		RetryPolicy:              convertToPBRetryPolicy(in.Options.RetryPolicy),
+		CronSchedule:             in.Options.CronSchedule,
+		Memo:                     memo,
+		SearchAttributes:         searchAttr,
+		Header:                   header,
+	}
+
+	var response *workflowservice.StartWorkflowExecutionResponse
+
+	grpcCtx, cancel := newGRPCContext(ctx, grpcMetricsHandler(
+		w.client.metricsHandler.WithTags(metrics.RPCTags(in.WorkflowType, metrics.NoneTagValue, in.Options.TaskQueue))),
+		defaultGrpcRetryParameters(ctx))
+	defer cancel()
+
+	response, err = w.client.workflowService.StartWorkflowExecution(grpcCtx, startRequest)
+
+	// Allow already-started error
+	var runID string
+	if e, ok := err.(*serviceerror.WorkflowExecutionAlreadyStarted); ok && !in.Options.WorkflowExecutionErrorWhenAlreadyStarted {
+		runID = e.RunId
+	} else if err != nil {
+		return nil, err
+	} else {
+		runID = response.RunId
+	}
+
+	iterFn := func(fnCtx context.Context, fnRunID string) HistoryEventIterator {
+		metricsHandler := w.client.metricsHandler.WithTags(metrics.RPCTags(in.WorkflowType,
+			metrics.NoneTagValue, in.Options.TaskQueue))
+		return w.client.getWorkflowHistory(fnCtx, workflowID, fnRunID, true,
+			enumspb.HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT, metricsHandler)
+	}
+
+	curRunIDCell := util.PopulatedOnceCell(runID)
+	return &workflowRunImpl{
+		workflowType:  in.WorkflowType,
+		workflowID:    workflowID,
+		firstRunID:    runID,
+		currentRunID:  &curRunIDCell,
+		iterFn:        iterFn,
+		dataConverter: w.client.dataConverter,
+		registry:      w.client.registry,
+	}, nil
+}
+
+func (w *workflowClientInterceptor) SignalWorkflow(ctx context.Context, in *ClientSignalWorkflowInput) error {
+	dataConverter := WithContext(ctx, w.client.dataConverter)
+	input, err := encodeArg(dataConverter, in.Arg)
+	if err != nil {
+		return err
+	}
+
+	// get workflow headers from the context
+	header, err := headerPropagated(ctx, w.client.contextPropagators)
+	if err != nil {
+		return err
+	}
+
+	request := &workflowservice.SignalWorkflowExecutionRequest{
+		Namespace: w.client.namespace,
+		RequestId: uuid.New(),
+		WorkflowExecution: &commonpb.WorkflowExecution{
+			WorkflowId: in.WorkflowID,
+			RunId:      in.RunID,
+		},
+		SignalName: in.SignalName,
+		Input:      input,
+		Identity:   w.client.identity,
+		Header:     header,
+	}
+
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	_, err = w.client.workflowService.SignalWorkflowExecution(grpcCtx, request)
+	return err
+}
+
+func (w *workflowClientInterceptor) SignalWithStartWorkflow(
+	ctx context.Context,
+	in *ClientSignalWithStartWorkflowInput,
+) (WorkflowRun, error) {
+
+	dataConverter := WithContext(ctx, w.client.dataConverter)
+	signalInput, err := encodeArg(dataConverter, in.SignalArg)
+	if err != nil {
+		return nil, err
+	}
+
+	executionTimeout := in.Options.WorkflowExecutionTimeout
+	runTimeout := in.Options.WorkflowRunTimeout
+	taskTimeout := in.Options.WorkflowTaskTimeout
+
+	// Encode input
+	input, err := encodeArgs(dataConverter, in.Args)
+	if err != nil {
+		return nil, err
+	}
+
+	memo, err := getWorkflowMemo(in.Options.Memo, dataConverter)
+	if err != nil {
+		return nil, err
+	}
+
+	searchAttr, err := serializeSearchAttributes(in.Options.SearchAttributes)
+	if err != nil {
+		return nil, err
+	}
+
+	// get workflow headers from the context
+	header, err := headerPropagated(ctx, w.client.contextPropagators)
+	if err != nil {
+		return nil, err
+	}
+
+	signalWithStartRequest := &workflowservice.SignalWithStartWorkflowExecutionRequest{
+		Namespace:                w.client.namespace,
+		RequestId:                uuid.New(),
+		WorkflowId:               in.Options.ID,
+		WorkflowType:             &commonpb.WorkflowType{Name: in.WorkflowType},
+		TaskQueue:                &taskqueuepb.TaskQueue{Name: in.Options.TaskQueue, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		Input:                    input,
+		WorkflowExecutionTimeout: &executionTimeout,
+		WorkflowRunTimeout:       &runTimeout,
+		WorkflowTaskTimeout:      &taskTimeout,
+		SignalName:               in.SignalName,
+		SignalInput:              signalInput,
+		Identity:                 w.client.identity,
+		RetryPolicy:              convertToPBRetryPolicy(in.Options.RetryPolicy),
+		CronSchedule:             in.Options.CronSchedule,
+		Memo:                     memo,
+		SearchAttributes:         searchAttr,
+		WorkflowIdReusePolicy:    in.Options.WorkflowIDReusePolicy,
+		Header:                   header,
+	}
+
+	var response *workflowservice.SignalWithStartWorkflowExecutionResponse
+
+	// Start creating workflow request.
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+
+	response, err = w.client.workflowService.SignalWithStartWorkflowExecution(grpcCtx, signalWithStartRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	iterFn := func(fnCtx context.Context, fnRunID string) HistoryEventIterator {
+		metricsHandler := w.client.metricsHandler.WithTags(metrics.RPCTags(in.WorkflowType,
+			metrics.NoneTagValue, in.Options.TaskQueue))
+		return w.client.getWorkflowHistory(fnCtx, in.Options.ID, fnRunID, true,
+			enumspb.HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT, metricsHandler)
+	}
+
+	curRunIDCell := util.PopulatedOnceCell(response.GetRunId())
+	return &workflowRunImpl{
+		workflowType:  in.WorkflowType,
+		workflowID:    in.Options.ID,
+		firstRunID:    response.GetRunId(),
+		currentRunID:  &curRunIDCell,
+		iterFn:        iterFn,
+		dataConverter: w.client.dataConverter,
+		registry:      w.client.registry,
+	}, nil
+}
+
+func (w *workflowClientInterceptor) CancelWorkflow(ctx context.Context, in *ClientCancelWorkflowInput) error {
+	request := &workflowservice.RequestCancelWorkflowExecutionRequest{
+		Namespace: w.client.namespace,
+		RequestId: uuid.New(),
+		WorkflowExecution: &commonpb.WorkflowExecution{
+			WorkflowId: in.WorkflowID,
+			RunId:      in.RunID,
+		},
+		Identity: w.client.identity,
+	}
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	_, err := w.client.workflowService.RequestCancelWorkflowExecution(grpcCtx, request)
+	return err
+}
+
+func (w *workflowClientInterceptor) TerminateWorkflow(ctx context.Context, in *ClientTerminateWorkflowInput) error {
+	datailsPayload, err := w.client.dataConverter.ToPayloads(in.Details...)
+	if err != nil {
+		return err
+	}
+
+	request := &workflowservice.TerminateWorkflowExecutionRequest{
+		Namespace: w.client.namespace,
+		WorkflowExecution: &commonpb.WorkflowExecution{
+			WorkflowId: in.WorkflowID,
+			RunId:      in.RunID,
+		},
+		Reason:   in.Reason,
+		Identity: w.client.identity,
+		Details:  datailsPayload,
+	}
+
+	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	_, err = w.client.workflowService.TerminateWorkflowExecution(grpcCtx, request)
+	return err
+}
+
+func (w *workflowClientInterceptor) QueryWorkflow(
+	ctx context.Context,
+	in *ClientQueryWorkflowInput,
+) (converter.EncodedValue, error) {
+	// get workflow headers from the context
+	header, err := headerPropagated(ctx, w.client.contextPropagators)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := w.client.QueryWorkflowWithOptions(ctx, &QueryWorkflowWithOptionsRequest{
+		WorkflowID: in.WorkflowID,
+		RunID:      in.RunID,
+		QueryType:  in.QueryType,
+		Args:       in.Args,
+		Header:     header,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.QueryResult, nil
+}
+
+// Required to implement ClientOutboundInterceptor
+func (*workflowClientInterceptor) mustEmbedClientOutboundInterceptorBase() {}

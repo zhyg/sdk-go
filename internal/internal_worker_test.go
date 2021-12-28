@@ -30,13 +30,13 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
-	"github.com/opentracing/opentracing-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -92,6 +92,7 @@ func testInternalWorkerRegister(r *registry) {
 		Name:                       "testActivityStructWithFns_",
 		SkipInvalidStructFunctions: true,
 	})
+	r.RegisterActivity(&testActivityStruct{})
 }
 
 func testInternalWorkerRegisterWithTestEnv(env *TestWorkflowEnvironment) {
@@ -130,6 +131,7 @@ func testInternalWorkerRegisterWithTestEnv(env *TestWorkflowEnvironment) {
 		Name:                       "testActivityStructWithFns_",
 		SkipInvalidStructFunctions: true,
 	})
+	env.RegisterActivity(&testActivityStruct{})
 }
 
 type internalWorkerTestSuite struct {
@@ -168,9 +170,12 @@ func (s *internalWorkerTestSuite) createLocalActivityMarkerDataForTest(activityI
 	markerData, err := s.dataConverter.ToPayloads(lamd)
 	s.NoError(err)
 
+	result, err := s.dataConverter.ToPayloads(nil)
+	s.NoError(err)
+
 	return map[string]*commonpb.Payloads{
-		localActivityMarkerDataDetailsName:   markerData,
-		localActivityMarkerResultDetailsName: {},
+		localActivityMarkerDataName: markerData,
+		localActivityResultName:     result,
 	}
 }
 
@@ -298,9 +303,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory() {
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflow)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -334,9 +340,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_LocalActivity() {
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowLocalActivity)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -373,9 +380,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_GetVersion() {
 	testEvents := createHistoryForGetVersionTests("testReplayWorkflowGetVersion")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowGetVersion)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -479,9 +487,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_LocalAndRemoteActivi
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowLocalAndRemoteActivity)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -518,9 +527,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_GetVersion_ReplacedC
 	testEvents := createHistoryForGetVersionTests("testReplayWorkflowGetVersionReplacedChangeID")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowGetVersionReplacedChangeID)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -552,9 +562,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_GetVersionRemoved() 
 	testEvents := createHistoryForGetVersionTests("testReplayWorkflowGetVersionRemoved")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowGetVersionRemoved)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -596,9 +607,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_GetVersion_AddNewBef
 	testEvents := createHistoryForGetVersionTests("testReplayWorkflowGetVersionAddNewBefore")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowGetVersionAddNewBefore)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -743,9 +755,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_GetVersionWithSideEf
 	}
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowGetVersionWithSideEffect)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -773,9 +786,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_CancelActivity() {
 	testEvents := createHistoryForCancelActivityTests("testReplayWorkflowCancelActivity")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowCancelActivity)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -850,9 +864,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_CancelTimer() {
 	testEvents := createHistoryForCancelTimerTests("testReplayWorkflowCancelTimer")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowCancelTimer)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -914,9 +929,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowCancelTimerAfterActivity() {
 	testEvents := createHistoryForCancelTimerAfterActivity("cancelTimerAfterActivityWorkflow")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(cancelTimerAfterActivityWorkflow)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -957,6 +973,67 @@ func createHistoryForCancelTimerAfterActivity(workflowType string) []*historypb.
 	}
 }
 
+func testReplayFailedToStartChildWorkflow(ctx Context) error {
+	opts := ChildWorkflowOptions{
+		WorkflowTaskTimeout:      5 * time.Second,
+		WorkflowExecutionTimeout: 10 * time.Second,
+		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		WorkflowID:               "workflowId",
+	}
+	ctx = WithChildWorkflowOptions(ctx, opts)
+	err := ExecuteChildWorkflow(ctx, "testWorkflow").GetChildWorkflowExecution().Get(ctx, nil)
+	if err != nil {
+		var childErr *ChildWorkflowExecutionAlreadyStartedError
+		if errors.As(err, &childErr) {
+			return nil
+		}
+		return err
+	}
+	return errors.New("expected an error, but didn't get one")
+}
+
+func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_FailedToStartChildWorkflow() {
+	testEvents := createHistoryForFailedToStartChildWorkflow("testReplayFailedToStartChildWorkflow")
+	history := &historypb.History{Events: testEvents}
+	logger := getLogger()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
+	replayer.RegisterWorkflow(testReplayFailedToStartChildWorkflow)
+	err = replayer.ReplayWorkflowHistory(logger, history)
+	require.NoError(s.T(), err)
+}
+
+func createHistoryForFailedToStartChildWorkflow(workflowType string) []*historypb.HistoryEvent {
+	taskQueue := "taskQueue1"
+	return []*historypb.HistoryEvent{
+		createTestEventWorkflowExecutionStarted(1, &historypb.WorkflowExecutionStartedEventAttributes{
+			WorkflowType: &commonpb.WorkflowType{Name: workflowType},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: taskQueue},
+			Input:        testEncodeFunctionArgs(converter.GetDefaultDataConverter()),
+		}),
+		createTestEventWorkflowTaskScheduled(2, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventWorkflowTaskStarted(3),
+		createTestEventWorkflowTaskCompleted(4, &historypb.WorkflowTaskCompletedEventAttributes{}),
+		createTestEventStartChildWorkflowExecutionInitiated(5, &historypb.StartChildWorkflowExecutionInitiatedEventAttributes{
+			TaskQueue:  &taskqueuepb.TaskQueue{Name: taskQueue},
+			WorkflowId: "workflowId",
+		}),
+		createTestEventStartChildWorkflowExecutionFailed(6, &historypb.StartChildWorkflowExecutionFailedEventAttributes{
+			WorkflowId:                   "workflowId",
+			InitiatedEventId:             5,
+			WorkflowTaskCompletedEventId: 4,
+			WorkflowType:                 &commonpb.WorkflowType{Name: "testWorkflow"},
+			Cause:                        enumspb.START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS,
+		}),
+		createTestEventWorkflowTaskScheduled(7, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventWorkflowTaskStarted(8),
+		createTestEventWorkflowTaskCompleted(9, &historypb.WorkflowTaskCompletedEventAttributes{}),
+		createTestEventWorkflowExecutionCompleted(10, &historypb.WorkflowExecutionCompletedEventAttributes{
+			WorkflowTaskCompletedEventId: 9,
+		}),
+	}
+}
+
 func testReplayWorkflowCancelChildWorkflow(ctx Context) error {
 	childCtx1, cancelFunc1 := WithCancel(ctx)
 
@@ -982,9 +1059,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_CancelChildWorkflow(
 	testEvents := createHistoryForCancelChildWorkflowTests("testReplayWorkflowCancelChildWorkflow")
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowCancelChildWorkflow)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.NoError(s.T(), err)
 }
 
@@ -1151,9 +1229,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_ChildWorkflowCancell
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowCancelChildWorkflowUnusualOrdering)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	if err != nil {
 		fmt.Printf("replay failed.  Error: %v", err.Error())
 	}
@@ -1218,9 +1297,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_CancelWorkflowWhileS
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowCancelWorkflowWhileSleepingWithActivities)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	if err != nil {
 		fmt.Printf("replay failed.  Error: %v", err.Error())
 	}
@@ -1259,9 +1339,10 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_LocalActivity_Result
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowLocalActivity)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	if err != nil {
 		fmt.Printf("replay failed.  Error: %v", err.Error())
 	}
@@ -1296,25 +1377,159 @@ func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_LocalActivity_Activi
 
 	history := &historypb.History{Events: testEvents}
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflow)
-	err := replayer.ReplayWorkflowHistory(logger, history)
+	err = replayer.ReplayWorkflowHistory(logger, history)
 	require.Error(s.T(), err)
+}
+
+func testReplayWorkflowSideEffect(ctx Context) error {
+	if err := Sleep(ctx, time.Second); err != nil {
+		return err
+	}
+
+	encodedRandom := SideEffect(ctx, func(ctx Context) interface{} {
+		return 100
+	})
+
+	var random int
+	if err := encodedRandom.Get(&random); err != nil {
+		return err
+	}
+	if random == 100 {
+		ao := ActivityOptions{
+			ScheduleToStartTimeout: time.Second,
+			StartToCloseTimeout:    time.Second,
+		}
+		ctx = WithActivityOptions(ctx, ao)
+
+		a1F := ExecuteActivity(ctx, "A1", "first")
+		a2F := ExecuteActivity(ctx, "A2", "second")
+		a3F := ExecuteActivity(ctx, "A3", "third")
+
+		var A1Result string
+		if err := a1F.Get(ctx, &A1Result); err != nil {
+			return err
+		}
+
+		err := a3F.Get(ctx, nil)
+		if err == nil {
+			getLogger().Info("activity A3 completed.")
+		}
+
+		err = a2F.Get(ctx, nil)
+		if err != nil {
+			getLogger().Info("activity A2 completed.")
+		}
+
+	}
+
+	getLogger().Info("workflow completed.")
+	return nil
+}
+
+func (s *internalWorkerTestSuite) TestReplayWorkflowHistory_SideEffect() {
+	taskQueue := "taskQueue1"
+	testEvents := []*historypb.HistoryEvent{
+		createTestEventWorkflowExecutionStarted(1, &historypb.WorkflowExecutionStartedEventAttributes{
+			WorkflowType: &commonpb.WorkflowType{Name: "testReplayWorkflowSideEffect"},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: taskQueue},
+			Input:        testEncodeFunctionArgs(converter.GetDefaultDataConverter()),
+		}),
+		createTestEventWorkflowTaskScheduled(2, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventWorkflowTaskStarted(3),
+		createTestEventWorkflowTaskCompleted(4, &historypb.WorkflowTaskCompletedEventAttributes{}),
+		createTestEventTimerStarted(5, 5),
+		createTestEventTimerFired(6, 5),
+		createTestEventWorkflowTaskScheduled(7, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventWorkflowTaskStarted(8),
+		createTestEventWorkflowTaskCompleted(9, &historypb.WorkflowTaskCompletedEventAttributes{}),
+		createTestEventSideEffectMarker(10, 9, 1, 100),
+
+		createTestEventActivityTaskScheduled(11, &historypb.ActivityTaskScheduledEventAttributes{
+			ActivityId:   "11",
+			ActivityType: &commonpb.ActivityType{Name: "A1"},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: taskQueue},
+		}),
+		createTestEventActivityTaskScheduled(12, &historypb.ActivityTaskScheduledEventAttributes{
+			ActivityId:   "12",
+			ActivityType: &commonpb.ActivityType{Name: "A2"},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: taskQueue},
+		}),
+		createTestEventActivityTaskScheduled(13, &historypb.ActivityTaskScheduledEventAttributes{
+			ActivityId:   "13",
+			ActivityType: &commonpb.ActivityType{Name: "A3"},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: taskQueue},
+		}),
+		createTestEventActivityTaskStarted(14, &historypb.ActivityTaskStartedEventAttributes{
+			ScheduledEventId: 11,
+		}),
+		createTestEventActivityTaskCompleted(15, &historypb.ActivityTaskCompletedEventAttributes{
+			ScheduledEventId: 11,
+			StartedEventId:   14,
+		}),
+		createTestEventWorkflowTaskScheduled(16, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventWorkflowTaskStarted(17),
+		createTestEventWorkflowTaskCompleted(18, &historypb.WorkflowTaskCompletedEventAttributes{
+			ScheduledEventId: 16,
+			StartedEventId:   17,
+		}),
+		createTestEventActivityTaskStarted(19, &historypb.ActivityTaskStartedEventAttributes{
+			ScheduledEventId: 13,
+		}),
+		createTestEventActivityTaskCompleted(20, &historypb.ActivityTaskCompletedEventAttributes{
+			ScheduledEventId: 13,
+			StartedEventId:   19,
+		}),
+		createTestEventWorkflowTaskScheduled(21, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventActivityTaskStarted(22, &historypb.ActivityTaskStartedEventAttributes{
+			ScheduledEventId: 12,
+		}),
+		createTestEventActivityTaskCompleted(23, &historypb.ActivityTaskCompletedEventAttributes{
+			ScheduledEventId: 12,
+			StartedEventId:   22,
+		}),
+		createTestEventWorkflowTaskTimedOut(24, &historypb.WorkflowTaskTimedOutEventAttributes{
+			ScheduledEventId: 21,
+			StartedEventId:   0,
+			TimeoutType:      enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START,
+		}),
+		createTestEventWorkflowTaskScheduled(25, &historypb.WorkflowTaskScheduledEventAttributes{}),
+		createTestEventWorkflowTaskStarted(26),
+		createTestEventWorkflowTaskCompleted(27, &historypb.WorkflowTaskCompletedEventAttributes{
+			ScheduledEventId: 25,
+			StartedEventId:   26,
+		}),
+		createTestEventWorkflowExecutionCompleted(28, &historypb.WorkflowExecutionCompletedEventAttributes{
+			WorkflowTaskCompletedEventId: 27,
+		}),
+	}
+
+	history := &historypb.History{Events: testEvents}
+	logger := getLogger()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
+	replayer.RegisterWorkflow(testReplayWorkflowSideEffect)
+	err = replayer.ReplayWorkflowHistory(logger, history)
+	require.NoError(s.T(), err)
 }
 
 func (s *internalWorkerTestSuite) TestReplayWorkflowHistoryFromFileParent() {
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowFromFileParent)
-	err := replayer.ReplayWorkflowHistoryFromJSONFile(logger, "testdata/parentWF.json")
+	err = replayer.ReplayWorkflowHistoryFromJSONFile(logger, "testdata/parentWF.json")
 	require.NoError(s.T(), err)
 }
 
 func (s *internalWorkerTestSuite) TestReplayWorkflowHistoryFromFile() {
 	logger := getLogger()
-	replayer := NewWorkflowReplayer()
+	replayer, err := NewWorkflowReplayer(WorkflowReplayerOptions{})
+	require.NoError(s.T(), err)
 	replayer.RegisterWorkflow(testReplayWorkflowFromFile)
-	err := replayer.ReplayWorkflowHistoryFromJSONFile(logger, "testdata/sampleHistory.json")
+	err = replayer.ReplayWorkflowHistoryFromJSONFile(logger, "testdata/sampleHistory.json")
 	require.NoError(s.T(), err)
 }
 
@@ -1378,7 +1593,7 @@ func testActivityMultipleArgs(context.Context, int, []string, bool) ([]byte, err
 }
 
 // test testActivityMultipleArgsWithStruct
-func testActivityMultipleArgsWithStruct(_ context.Context, i int, s testActivityArg) ([]byte, error) {
+func testActivityMultipleArgsWithStruct(_ context.Context, i int, s *testActivityArg) ([]byte, error) {
 	fmt.Printf("Executing testActivityMultipleArgsWithStruct: %d, %v\n", i, s)
 	return nil, nil
 }
@@ -1410,6 +1625,10 @@ func (s *internalWorkerTestSuite) TestCreateWorkerWithDataConverter() {
 }
 
 func (s *internalWorkerTestSuite) TestCreateWorkerRun() {
+	// Windows doesn't support signalling interrupt.
+	if runtime.GOOS == "windows" {
+		s.T().Skip("Not supported on windows")
+	}
 	// Create service endpoint
 	mockCtrl := gomock.NewController(s.T())
 	service := workflowservicemock.NewMockWorkflowServiceClient(mockCtrl)
@@ -1439,57 +1658,28 @@ func (s *internalWorkerTestSuite) TestNoActivitiesOrWorkflows() {
 	assert.Empty(t, w.registry.getRegisteredActivities())
 	assert.Empty(t, w.registry.getRegisteredWorkflowTypes())
 	assert.NoError(t, w.Start())
-	assert.False(t, w.activityWorker.worker.isWorkerStarted)
-	assert.False(t, w.workflowWorker.worker.isWorkerStarted)
+	assert.True(t, w.activityWorker.worker.isWorkerStarted)
+	assert.True(t, w.workflowWorker.worker.isWorkerStarted)
 }
 
-func (s *internalWorkerTestSuite) TestWorkerStartFailsWithInvalidNamespace() {
-	t := s.T()
-	testCases := []struct {
-		namespaceErr error
-		isErrFatal   bool
-	}{
-		{serviceerror.NewNotFound(""), true},
-		{serviceerror.NewInvalidArgument(""), true},
-		{serviceerror.NewInternal(""), false},
-		{errors.New("unknown"), false},
-	}
-
-	mockCtrl := gomock.NewController(t)
-
-	for _, tc := range testCases {
-		service := workflowservicemock.NewMockWorkflowServiceClient(mockCtrl)
-		service.EXPECT().DescribeNamespace(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, tc.namespaceErr).Do(
-			func(ctx context.Context, request *workflowservice.DescribeNamespaceRequest, opts ...grpc.CallOption) {
-				// log
-			}).Times(2)
-
-		worker := createWorker(service)
-		worker.RegisterActivity(testActivityNoResult)
-		worker.RegisterWorkflow(testWorkflowReturnStruct)
-		if tc.isErrFatal {
-			err := worker.Start()
-			assert.Error(t, err, "worker.start() MUST fail when namespace is invalid")
-			errC := make(chan error)
-			go func() { errC <- worker.Run(InterruptCh()) }()
-			select {
-			case e := <-errC:
-				assert.Error(t, e, "worker.Run() MUST fail when namespace is invalid")
-			case <-time.After(time.Second):
-				assert.Fail(t, "worker.Run() MUST fail when namespace is invalid")
-			}
-			assert.False(t, worker.activityWorker.worker.isWorkerStarted)
-			assert.False(t, worker.workflowWorker.worker.isWorkerStarted)
-			continue
+func (s *internalWorkerTestSuite) TestStartWorkerAfterStopped() {
+	defer func() {
+		if r := recover(); r == nil {
+			assert.Fail(s.T(), "calling start after stop must result in panic")
 		}
-		err := worker.Start()
-		assert.NoError(t, err, "worker.Start() failed unexpectedly")
-		assert.True(t, worker.activityWorker.worker.isWorkerStarted)
-		assert.True(t, worker.workflowWorker.worker.isWorkerStarted)
-		worker.Stop()
-		assert.False(t, worker.activityWorker.worker.isWorkerStarted)
-		assert.False(t, worker.workflowWorker.worker.isWorkerStarted)
-	}
+	}()
+	worker := createWorkerWithThrottle(s.service, 500.0, nil)
+	worker.RegisterActivity(testActivityNoResult)
+	worker.RegisterWorkflow(testWorkflowReturnStruct)
+	err := worker.Start()
+	require.NoError(s.T(), err)
+	time.Sleep(time.Millisecond * 200)
+	assert.True(s.T(), worker.activityWorker.worker.isWorkerStarted)
+	assert.True(s.T(), worker.workflowWorker.worker.isWorkerStarted)
+	worker.Stop()
+	assert.False(s.T(), worker.activityWorker.worker.isWorkerStarted)
+	assert.False(s.T(), worker.workflowWorker.worker.isWorkerStarted)
+	_ = worker.Start() // must panic
 }
 
 func ofPollActivityTaskQueueRequest(tps float64) gomock.Matcher {
@@ -1611,6 +1801,25 @@ func (s *internalWorkerTestSuite) TestCompleteActivityWithDataConverter() {
 	s.testCompleteActivityHelper(opt)
 }
 
+func (s *internalWorkerTestSuite) TestCompleteActivityWithContextAwareDataConverter() {
+	dc := NewContextAwareDataConverter(converter.GetDefaultDataConverter())
+	client := NewServiceClient(s.service, nil, ClientOptions{DataConverter: dc})
+
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, ContextAwareDataConverterContextKey, "e")
+
+	response := &workflowservice.RespondActivityTaskCompletedResponse{}
+
+	s.service.EXPECT().RespondActivityTaskCompleted(gomock.Any(), gomock.Any(), gomock.Any()).Return(response, nil).
+		Do(func(_ interface{}, req *workflowservice.RespondActivityTaskCompletedRequest, _ ...interface{}) {
+			dc := client.dataConverter
+			results := dc.ToStrings(req.Result)
+			s.Equal("\"t?st\"", results[0])
+		})
+
+	_ = client.CompleteActivity(ctx, []byte("task-token"), "test", nil)
+}
+
 func (s *internalWorkerTestSuite) TestCompleteActivityById() {
 	t := s.T()
 	mockService := s.service
@@ -1641,6 +1850,25 @@ func (s *internalWorkerTestSuite) TestCompleteActivityById() {
 
 	_ = wfClient.CompleteActivityByID(context.Background(), DefaultNamespace, workflowID, runID, activityID, nil, errors.New(""))
 	require.NotNil(t, failedRequest)
+}
+
+func (s *internalWorkerTestSuite) TestCompleteActivityByIDWithContextAwareDataConverter() {
+	dc := NewContextAwareDataConverter(converter.GetDefaultDataConverter())
+	client := NewServiceClient(s.service, nil, ClientOptions{DataConverter: dc})
+
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, ContextAwareDataConverterContextKey, "e")
+
+	response := &workflowservice.RespondActivityTaskCompletedByIdResponse{}
+
+	s.service.EXPECT().RespondActivityTaskCompletedById(gomock.Any(), gomock.Any(), gomock.Any()).Return(response, nil).
+		Do(func(_ interface{}, req *workflowservice.RespondActivityTaskCompletedByIdRequest, _ ...interface{}) {
+			dc := client.dataConverter
+			results := dc.ToStrings(req.Result)
+			s.Equal("\"t?st\"", results[0])
+		})
+
+	_ = client.CompleteActivityByID(ctx, DefaultNamespace, "wid", "", "aid", "test", nil)
 }
 
 func (s *internalWorkerTestSuite) TestRecordActivityHeartbeat() {
@@ -1699,113 +1927,140 @@ type activitiesCallingOptionsWorkflow struct {
 }
 
 func (w activitiesCallingOptionsWorkflow) Execute(ctx Context, input []byte) (result []byte, err error) {
+	type exeType func(activity interface{}, args ...interface{}) Future
+	type exeAndCtx struct {
+		exe exeType
+		ctx Context
+	}
+
 	ao := ActivityOptions{
 		ScheduleToStartTimeout: 10 * time.Second,
 		StartToCloseTimeout:    5 * time.Second,
 	}
-	ctx = WithActivityOptions(ctx, ao)
+	nonlocalCtx := WithActivityOptions(ctx, ao)
+	nonlocalExecutor := func(activity interface{}, args ...interface{}) Future {
+		return ExecuteActivity(nonlocalCtx, activity, args...)
+	}
+	localOptions := LocalActivityOptions{
+		StartToCloseTimeout: time.Second * 5,
+	}
+	localCtx := WithLocalActivityOptions(ctx, localOptions)
+	localExecutor := func(activity interface{}, args ...interface{}) Future {
+		return ExecuteLocalActivity(localCtx, activity, args...)
+	}
+	nonlocal := exeAndCtx{exe: nonlocalExecutor, ctx: nonlocalCtx}
+	local := exeAndCtx{exe: localExecutor, ctx: localCtx}
 
-	// By functions.
-	err = ExecuteActivity(ctx, testActivityByteArgs, input).Get(ctx, nil)
-	require.NoError(w.t, err, err)
+	for _, executor := range []exeAndCtx{nonlocal, local} {
+		// By functions.
+		err = executor.exe(testActivityByteArgs, input).Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, testActivityMultipleArgs, 2, []string{"test"}, true).Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe(testActivityMultipleArgs, 2, []string{"test"}, true).Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, testActivityMultipleArgsWithStruct, -8, newTestActivityArg()).Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe(testActivityMultipleArgsWithStruct, -8, newTestActivityArg()).Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, testActivityNoResult, 2, "test").Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe(testActivityNoResult, 2, "test").Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, testActivityNoContextArg, 2, "test").Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe(testActivityNoContextArg, 2, "test").Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	f := ExecuteActivity(ctx, testActivityReturnByteArray)
-	var r []byte
-	err = f.Get(ctx, &r)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, []byte("testActivity"), r)
+		f := executor.exe(testActivityReturnByteArray)
+		var r []byte
+		err = f.Get(executor.ctx, &r)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, []byte("testActivity"), r)
 
-	f = ExecuteActivity(ctx, testActivityReturnInt)
-	var rInt int
-	err = f.Get(ctx, &rInt)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, 5, rInt)
+		f = executor.exe(testActivityReturnInt)
+		var rInt int
+		err = f.Get(executor.ctx, &rInt)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, 5, rInt)
 
-	f = ExecuteActivity(ctx, testActivityReturnString)
-	var rString string
-	err = f.Get(ctx, &rString)
+		f = executor.exe(testActivityReturnString)
+		var rString string
+		err = f.Get(executor.ctx, &rString)
 
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, "testActivity", rString)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, "testActivity", rString)
 
-	f = ExecuteActivity(ctx, testActivityReturnEmptyString)
-	var r2String string
-	err = f.Get(ctx, &r2String)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, "", r2String)
+		f = executor.exe(testActivityReturnEmptyString)
+		var r2String string
+		err = f.Get(executor.ctx, &r2String)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, "", r2String)
 
-	f = ExecuteActivity(ctx, testActivityReturnEmptyStruct)
-	var r2Struct testActivityResult
-	err = f.Get(ctx, &r2Struct)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, testActivityResult{}, r2Struct)
+		f = executor.exe(testActivityReturnEmptyStruct)
+		var r2Struct testActivityResult
+		err = f.Get(executor.ctx, &r2Struct)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, testActivityResult{}, r2Struct)
 
-	f = ExecuteActivity(ctx, testActivityReturnNilStructPtr)
-	var rStructPtr *testActivityResult
-	err = f.Get(ctx, &rStructPtr)
-	require.NoError(w.t, err, err)
-	require.True(w.t, rStructPtr == nil)
+		f = executor.exe(testActivityReturnNilStructPtr)
+		var rStructPtr *testActivityResult
+		err = f.Get(executor.ctx, &rStructPtr)
+		require.NoError(w.t, err, err)
+		require.True(w.t, rStructPtr == nil)
 
-	f = ExecuteActivity(ctx, testActivityReturnStructPtr)
-	err = f.Get(ctx, &rStructPtr)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, *rStructPtr, testActivityResult{Index: 10})
+		f = executor.exe(testActivityReturnStructPtr)
+		err = f.Get(executor.ctx, &rStructPtr)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, *rStructPtr, testActivityResult{Index: 10})
 
-	f = ExecuteActivity(ctx, testActivityReturnNilStructPtrPtr)
-	var rStruct2Ptr **testActivityResult
-	err = f.Get(ctx, &rStruct2Ptr)
-	require.NoError(w.t, err, err)
-	require.True(w.t, rStruct2Ptr == nil)
+		f = executor.exe(testActivityReturnNilStructPtrPtr)
+		var rStruct2Ptr **testActivityResult
+		err = f.Get(executor.ctx, &rStruct2Ptr)
+		require.NoError(w.t, err, err)
+		require.True(w.t, rStruct2Ptr == nil)
 
-	f = ExecuteActivity(ctx, testActivityReturnStructPtrPtr)
-	err = f.Get(ctx, &rStruct2Ptr)
-	require.NoError(w.t, err, err)
-	require.True(w.t, **rStruct2Ptr == testActivityResult{Index: 10})
+		f = executor.exe(testActivityReturnStructPtrPtr)
+		err = f.Get(executor.ctx, &rStruct2Ptr)
+		require.NoError(w.t, err, err)
+		require.True(w.t, **rStruct2Ptr == testActivityResult{Index: 10})
 
-	// By names.
-	err = ExecuteActivity(ctx, "testActivityByteArgs", input).Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		// By names.
+		err = executor.exe("testActivityByteArgs", input).Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, "testActivityMultipleArgs", 2, []string{"test"}, true).Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe("testActivityMultipleArgs", 2, []string{"test"}, true).Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, "testActivityNoResult", 2, "test").Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe("testActivityNoResult", 2, "test").Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	err = ExecuteActivity(ctx, "testActivityNoContextArg", 2, "test").Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		err = executor.exe("testActivityNoContextArg", 2, "test").Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
 
-	f = ExecuteActivity(ctx, "testActivityReturnString")
-	err = f.Get(ctx, &rString)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, "testActivity", rString, rString)
+		f = executor.exe("testActivityReturnString")
+		err = f.Get(executor.ctx, &rString)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, "testActivity", rString, rString)
 
-	f = ExecuteActivity(ctx, "testActivityReturnEmptyString")
-	var r2sString string
-	err = f.Get(ctx, &r2String)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, "", r2sString)
+		f = executor.exe("testActivityReturnEmptyString")
+		var r2sString string
+		err = f.Get(executor.ctx, &r2String)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, "", r2sString)
 
-	f = ExecuteActivity(ctx, "testActivityReturnEmptyStruct")
-	err = f.Get(ctx, &r2Struct)
-	require.NoError(w.t, err, err)
-	require.Equal(w.t, testActivityResult{}, r2Struct)
+		f = executor.exe("testActivityReturnEmptyStruct")
+		err = f.Get(executor.ctx, &r2Struct)
+		require.NoError(w.t, err, err)
+		require.Equal(w.t, testActivityResult{}, r2Struct)
 
-	f = ExecuteActivity(ctx, "testActivityStructWithFns_ValidActivity")
-	err = f.Get(ctx, nil)
-	require.NoError(w.t, err, err)
+		f = executor.exe("testActivityStructWithFns_ValidActivity")
+		err = f.Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
+
+		// By struct
+		actStruct := &testActivityStruct{}
+		f = executor.exe(actStruct.SomeActivity)
+		err = f.Get(executor.ctx, nil)
+		require.NoError(w.t, err, err)
+
+	}
 
 	return []byte("Done"), nil
 }
@@ -1898,6 +2153,12 @@ func testInfiniteActivity(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+type testActivityStruct struct{}
+
+func (a *testActivityStruct) SomeActivity() (string, error) {
+	return "some activity on a struct", nil
 }
 
 type testActivityStructWithFns struct{}
@@ -2061,7 +2322,7 @@ func testActivityErrorWithDetailsHelper(ctx context.Context, t *testing.T, dataC
 
 func TestActivityErrorWithDetailsWithDataConverter(t *testing.T) {
 	dc := iconverter.NewTestDataConverter()
-	ctx := context.WithValue(context.Background(), activityEnvContextKey, &activityEnvironment{dataConverter: dc})
+	ctx, _ := newActivityContext(context.Background(), nil, &activityEnvironment{dataConverter: dc})
 	testActivityErrorWithDetailsHelper(ctx, t, dc)
 }
 
@@ -2124,7 +2385,7 @@ func testActivityCanceledErrorHelper(ctx context.Context, t *testing.T, dataConv
 
 func TestActivityCanceledErrorWithDataConverter(t *testing.T) {
 	dc := iconverter.NewTestDataConverter()
-	ctx := context.WithValue(context.Background(), activityEnvContextKey, &activityEnvironment{dataConverter: dc})
+	ctx, _ := newActivityContext(context.Background(), nil, &activityEnvironment{dataConverter: dc})
 	testActivityCanceledErrorHelper(ctx, t, dc)
 }
 
@@ -2153,7 +2414,7 @@ func testActivityExecutionVariousTypesHelper(ctx context.Context, t *testing.T, 
 
 func TestActivityExecutionVariousTypesWithDataConverter(t *testing.T) {
 	dc := iconverter.NewTestDataConverter()
-	ctx := context.WithValue(context.Background(), activityEnvContextKey, &activityEnvironment{
+	ctx, _ := newActivityContext(context.Background(), nil, &activityEnvironment{
 		dataConverter: dc,
 	})
 	testActivityExecutionVariousTypesHelper(ctx, t, dc)
@@ -2191,7 +2452,7 @@ func TestWorkerOptionDefaults(t *testing.T) {
 	workflowWorker := aggWorker.workflowWorker
 	require.True(t, workflowWorker.executionParameters.Identity != "")
 	require.NotNil(t, workflowWorker.executionParameters.Logger)
-	require.NotNil(t, workflowWorker.executionParameters.MetricsScope)
+	require.NotNil(t, workflowWorker.executionParameters.MetricsHandler)
 	require.Nil(t, workflowWorker.executionParameters.ContextPropagators)
 
 	expected := workerExecutionParameters{
@@ -2207,9 +2468,8 @@ func TestWorkerOptionDefaults(t *testing.T) {
 		WorkerLocalActivitiesPerSecond:        defaultWorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:          stickyWorkflowTaskScheduleToStartTimeoutSeconds * time.Second,
 		DataConverter:                         converter.GetDefaultDataConverter(),
-		Tracer:                                opentracing.NoopTracer{},
 		Logger:                                workflowWorker.executionParameters.Logger,
-		MetricsScope:                          workflowWorker.executionParameters.MetricsScope,
+		MetricsHandler:                        workflowWorker.executionParameters.MetricsHandler,
 		Identity:                              workflowWorker.executionParameters.Identity,
 		UserContext:                           workflowWorker.executionParameters.UserContext,
 	}
@@ -2219,7 +2479,7 @@ func TestWorkerOptionDefaults(t *testing.T) {
 	activityWorker := aggWorker.activityWorker
 	require.True(t, activityWorker.executionParameters.Identity != "")
 	require.NotNil(t, activityWorker.executionParameters.Logger)
-	require.NotNil(t, activityWorker.executionParameters.MetricsScope)
+	require.NotNil(t, activityWorker.executionParameters.MetricsHandler)
 	require.Nil(t, activityWorker.executionParameters.ContextPropagators)
 	assertWorkerExecutionParamsEqual(t, expected, activityWorker.executionParameters)
 }
@@ -2235,7 +2495,6 @@ func TestWorkerOptionNonDefaults(t *testing.T) {
 		identity:           "143@worker-options-test-1",
 		dataConverter:      &converter.CompositeDataConverter{},
 		contextPropagators: nil,
-		tracer:             nil,
 		logger:             ilog.NewNopLogger(),
 	}
 
@@ -2270,9 +2529,8 @@ func TestWorkerOptionNonDefaults(t *testing.T) {
 		WorkerLocalActivitiesPerSecond:        options.WorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:          options.StickyScheduleToStartTimeout,
 		DataConverter:                         client.dataConverter,
-		Tracer:                                client.tracer,
 		Logger:                                client.logger,
-		MetricsScope:                          client.metricsScope,
+		MetricsHandler:                        client.metricsHandler,
 		Identity:                              client.identity,
 	}
 
@@ -2291,7 +2549,7 @@ func TestLocalActivityWorkerOnly(t *testing.T) {
 	workflowWorker := aggWorker.workflowWorker
 	require.True(t, workflowWorker.executionParameters.Identity != "")
 	require.NotNil(t, workflowWorker.executionParameters.Logger)
-	require.NotNil(t, workflowWorker.executionParameters.MetricsScope)
+	require.NotNil(t, workflowWorker.executionParameters.MetricsHandler)
 	require.Nil(t, workflowWorker.executionParameters.ContextPropagators)
 
 	expected := workerExecutionParameters{
@@ -2307,9 +2565,8 @@ func TestLocalActivityWorkerOnly(t *testing.T) {
 		WorkerLocalActivitiesPerSecond:        defaultWorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:          stickyWorkflowTaskScheduleToStartTimeoutSeconds * time.Second,
 		DataConverter:                         converter.GetDefaultDataConverter(),
-		Tracer:                                opentracing.NoopTracer{},
 		Logger:                                workflowWorker.executionParameters.Logger,
-		MetricsScope:                          workflowWorker.executionParameters.MetricsScope,
+		MetricsHandler:                        workflowWorker.executionParameters.MetricsHandler,
 		Identity:                              workflowWorker.executionParameters.Identity,
 		UserContext:                           workflowWorker.executionParameters.UserContext,
 	}
@@ -2326,7 +2583,6 @@ func assertWorkerExecutionParamsEqual(t *testing.T, paramsA workerExecutionParam
 	require.Equal(t, paramsA.TaskQueue, paramsA.TaskQueue)
 	require.Equal(t, paramsA.Identity, paramsB.Identity)
 	require.Equal(t, paramsA.DataConverter, paramsB.DataConverter)
-	require.Equal(t, paramsA.Tracer, paramsB.Tracer)
 	require.Equal(t, paramsA.ConcurrentLocalActivityExecutionSize, paramsB.ConcurrentLocalActivityExecutionSize)
 	require.Equal(t, paramsA.ConcurrentActivityExecutionSize, paramsB.ConcurrentActivityExecutionSize)
 	require.Equal(t, paramsA.ConcurrentWorkflowTaskExecutionSize, paramsB.ConcurrentWorkflowTaskExecutionSize)

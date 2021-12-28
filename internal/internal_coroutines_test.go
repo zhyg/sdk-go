@@ -40,11 +40,11 @@ import (
 
 func createRootTestContext() (interceptor *workflowEnvironmentInterceptor, ctx Context) {
 	env := new(WorkflowUnitTest).NewTestWorkflowEnvironment()
-	envInterceptor, err := newWorkflowInterceptors(env.impl, env.impl.GetRegistry().getInterceptors())
+	envInterceptor, ctx, err := newWorkflowContext(env.impl, env.impl.GetRegistry().interceptors)
 	if err != nil {
 		panic(err)
 	}
-	return envInterceptor, newWorkflowContext(env.impl, envInterceptor.outboundInterceptor, envInterceptor)
+	return envInterceptor, ctx
 }
 
 func createNewDispatcher(f func(ctx Context)) dispatcher {
@@ -66,7 +66,7 @@ func TestDispatcher(t *testing.T) {
 	d := createNewDispatcher(func(ctx Context) { value = "bar" })
 	defer d.Close()
 	require.Equal(t, "foo", value)
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 	require.Equal(t, "bar", value)
 }
@@ -84,7 +84,7 @@ func TestNonBlockingChildren(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	require.EqualValues(t, 11, len(history))
@@ -108,7 +108,7 @@ func TestNonbufferedChannel(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -155,12 +155,12 @@ func TestNonbufferedChannelBlockedReceive(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	c2.SendAsync("value21")
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
-	_ = d.ExecuteUntilAllBlocked()
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
+	_ = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	c2.SendAsync("value22")
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 
 	require.True(t, d.IsDone(), d.StackTrace())
 }
@@ -187,7 +187,7 @@ func TestBufferedChannelPut(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -238,7 +238,7 @@ func TestBufferedChannelGet(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), strings.Join(history, "\n")+"\n\n"+d.StackTrace())
 
 	expected := []string{
@@ -290,7 +290,7 @@ func TestNotBlockingSelect(t *testing.T) {
 		require.False(t, s.HasPending())
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -339,7 +339,7 @@ func TestBlockingSelect(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), strings.Join(history, "\n"))
 
 	expected := []string{
@@ -381,7 +381,7 @@ func TestBlockingSelectAsyncSend(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), strings.Join(history, "\n"))
 
 	expected := []string{
@@ -430,7 +430,7 @@ func TestSelectOnClosedChannel(t *testing.T) {
 		require.False(t, selector.HasPending())
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), strings.Join(history, "\n"))
 
 	expected := []string{
@@ -475,7 +475,7 @@ func TestBlockingSelectAsyncSend2(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), strings.Join(history, "\n"))
 
 	expected := []string{
@@ -519,7 +519,7 @@ func TestSendSelect(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -562,7 +562,7 @@ func TestSendSelectWithAsyncReceive(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), strings.Join(history, "\n"))
 
 	expected := []string{
@@ -609,7 +609,7 @@ func TestChannelClose(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone(), d.StackTrace())
 
 	expected := []string{
@@ -638,7 +638,7 @@ func TestSendClosedChannel(t *testing.T) {
 		c.Send(ctx, "baz")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 }
 
@@ -653,7 +653,7 @@ func TestBlockedSendClosedChannel(t *testing.T) {
 		c.Send(ctx, "baz")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 }
 
@@ -668,7 +668,7 @@ func TestAsyncSendClosedChannel(t *testing.T) {
 		_ = c.SendAsync("baz")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 }
 
@@ -687,7 +687,7 @@ func TestDispatchClose(t *testing.T) {
 		c.Receive(ctx, nil) // blocked forever
 	})
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.False(t, d.IsDone())
 	stack := d.StackTrace()
 	// 11 coroutines (3 lines each) + 10 nl
@@ -726,7 +726,7 @@ func TestPanic(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	err := d.ExecuteUntilAllBlocked()
+	err := d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.Error(t, err)
 	value := err.Error()
 	require.EqualValues(t, "simulated failure", value)
@@ -736,22 +736,60 @@ func TestPanic(t *testing.T) {
 	require.Contains(t, panicError.StackTrace(), "go.temporal.io/sdk/internal.TestPanic")
 }
 
+func TestChannelReceivePointer(t *testing.T) {
+	// This confirms that a sent pointer can be received as a pointer
+	d := createNewDispatcher(func(ctx Context) {
+		type MyStruct struct{ Foo string }
+		// Create channel and a non-pointer and a pointer in
+		c := NewBufferedChannel(ctx, 2)
+		c.Send(ctx, MyStruct{Foo: "1"})
+		c.Send(ctx, &MyStruct{Foo: "2"})
+
+		// Confirm they both can be received as pointers
+		var val MyStruct
+		c.Receive(ctx, &val)
+		require.Equal(t, "1", val.Foo)
+		c.Receive(ctx, &val)
+		require.Equal(t, "2", val.Foo)
+	})
+	defer d.Close()
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
+	require.True(t, d.IsDone())
+}
+
 func TestAwait(t *testing.T) {
 	flag := false
 	d := createNewDispatcher(func(ctx Context) {
 		_ = Await(ctx, func() bool { return flag })
 	})
 	defer d.Close()
-	err := d.ExecuteUntilAllBlocked()
+	err := d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.False(t, d.IsDone())
-	err = d.ExecuteUntilAllBlocked()
+	err = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.False(t, d.IsDone())
 	flag = true
-	err = d.ExecuteUntilAllBlocked()
+	err = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.True(t, d.IsDone())
+}
+
+func TestDeadlockDetectorAndAwaitRace(t *testing.T) {
+	// Expecting deadlock detection timeout instead of a data race.
+	defer func() {
+		err := recover()
+		require.NotNil(t, err, "panic expected")
+		require.Equal(t, err, "Potential deadlock detected: workflow goroutine \"root\" didn't yield for over a second")
+	}()
+	d := createNewDispatcher(func(ctx Context) {
+		_ = Await(ctx, func() bool {
+			time.Sleep(defaultDeadlockDetectionTimeout)
+			return false
+		})
+	})
+	_ = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
+	d.Close()
 }
 
 func TestAwaitCancellation(t *testing.T) {
@@ -762,11 +800,11 @@ func TestAwaitCancellation(t *testing.T) {
 		awaitError = Await(ctx, func() bool { return false })
 	})
 	defer d.Close()
-	err := d.ExecuteUntilAllBlocked()
+	err := d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.False(t, d.IsDone())
 	cancelHandler()
-	err = d.ExecuteUntilAllBlocked()
+	err = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.True(t, d.IsDone())
 	require.Error(t, awaitError)
@@ -782,16 +820,16 @@ func TestAwaitWithTimeoutNoTimeout(t *testing.T) {
 		awaitOk, awaitWithTimeoutError = AwaitWithTimeout(ctx, time.Hour, func() bool { return flag })
 	})
 	defer d.Close()
-	err := d.ExecuteUntilAllBlocked()
+	err := d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.False(t, d.IsDone())
 	require.False(t, awaitOk)
 	require.NoError(t, awaitWithTimeoutError)
-	err = d.ExecuteUntilAllBlocked()
+	err = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.False(t, d.IsDone())
 	flag = true
-	err = d.ExecuteUntilAllBlocked()
+	err = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.True(t, awaitOk)
 	require.True(t, d.IsDone())
@@ -806,13 +844,13 @@ func TestAwaitWithTimeoutCancellation(t *testing.T) {
 		awaitOk, awaitWithTimeoutError = AwaitWithTimeout(ctx, time.Hour, func() bool { return false })
 	})
 	defer d.Close()
-	err := d.ExecuteUntilAllBlocked()
+	err := d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.False(t, d.IsDone())
 	require.False(t, awaitOk)
 	require.NoError(t, awaitWithTimeoutError)
 	cancelHandler()
-	err = d.ExecuteUntilAllBlocked()
+	err = d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout)
 	require.NoError(t, err)
 	require.True(t, d.IsDone())
 	require.Error(t, awaitWithTimeoutError)
@@ -845,13 +883,13 @@ func TestFutureSetValue(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "future-set")
 	require.False(t, f.IsReady())
 	s.SetValue("value1")
 	require.True(t, f.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -890,13 +928,13 @@ func TestFutureFail(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "future-set")
 	require.False(t, f.IsReady())
 	s.SetError(errors.New("value1"))
 	assert.True(t, f.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -949,20 +987,20 @@ func TestFutureSet(t *testing.T) {
 	defer d.Close()
 
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "f1-set")
 	require.False(t, f1.IsReady())
 	s1.Set("value-will-be-ignored", errors.New("error1"))
 	assert.True(t, f1.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "f2-set")
 	require.False(t, f2.IsReady())
 	s2.Set("value2", nil)
 	assert.True(t, f2.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -1022,20 +1060,20 @@ func TestFutureChain(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "f1-set")
 	require.False(t, f1.IsReady())
 	cs1.Set("value1-will-be-ignored", errors.New("error1"))
 	assert.True(t, f1.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "f2-set")
 	require.False(t, f2.IsReady())
 	cs2.Set("value2", nil)
 	assert.True(t, f2.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 
 	require.True(t, d.IsDone())
 
@@ -1088,7 +1126,7 @@ func TestSelectFuture(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -1142,7 +1180,7 @@ func TestSelectDecodeFuture(t *testing.T) {
 		history = append(history, "done")
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -1202,14 +1240,14 @@ func TestDecodeFutureChain(t *testing.T) {
 	})
 	defer d.Close()
 	require.EqualValues(t, 0, len(history))
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	// set f1
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
 	history = append(history, "f1-set")
 	require.False(t, f1.IsReady())
 	cs1.Set([]byte("value-will-be-ignored"), errors.New("error1"))
 	assert.True(t, f1.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 
 	// set f2
 	require.False(t, d.IsDone(), fmt.Sprintf("%v", d.StackTrace()))
@@ -1219,7 +1257,7 @@ func TestDecodeFutureChain(t *testing.T) {
 	require.NoError(t, err)
 	cs2.Set(v2, nil)
 	assert.True(t, f2.IsReady())
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 
 	require.True(t, d.IsDone())
 
@@ -1279,7 +1317,7 @@ func TestSelectFuture_WithBatchSets(t *testing.T) {
 		require.False(t, s.HasPending())
 	})
 	defer d.Close()
-	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked())
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
 	require.True(t, d.IsDone())
 
 	expected := []string{
@@ -1316,4 +1354,29 @@ func TestChainedFuture(t *testing.T) {
 	var out int
 	require.NoError(t, env.GetWorkflowResult(&out))
 	require.Equal(t, 5, out)
+}
+
+func TestFutureUnmarshalPointerToPointer(t *testing.T) {
+	// Standard futures and decode futures should both be able to unmarshal into
+	// a pointer even if they already are a pointer.
+	d := createNewDispatcher(func(ctx Context) {
+		type MyStruct struct{ Value string }
+		toSet := &MyStruct{Value: "MyValue"}
+		toSetPayload, err := converter.GetDefaultDataConverter().ToPayloads(toSet)
+		require.NoError(t, err)
+		var toGet1, toGet2 MyStruct
+
+		fut1, set1 := newDecodeFuture(ctx, nil)
+		set1.SetValue(toSetPayload)
+		require.NoError(t, fut1.Get(ctx, &toGet1))
+		require.Equal(t, "MyValue", toGet1.Value)
+
+		fut2, set2 := NewFuture(ctx)
+		set2.SetValue(toSet)
+		require.NoError(t, fut2.Get(ctx, &toGet2))
+		require.Equal(t, "MyValue", toGet2.Value)
+	})
+	defer d.Close()
+	requireNoExecuteErr(t, d.ExecuteUntilAllBlocked(defaultDeadlockDetectionTimeout))
+	require.True(t, d.IsDone())
 }

@@ -45,18 +45,15 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/mock/gomock"
-	"github.com/opentracing/opentracing-go"
 	"github.com/pborman/uuid"
-	"github.com/uber-go/tally"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
-	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/api/workflowservicemock/v1"
 
 	"go.temporal.io/sdk/converter"
-	"go.temporal.io/sdk/internal/common/backoff"
+	"go.temporal.io/sdk/internal/common/metrics"
 	"go.temporal.io/sdk/internal/common/serializer"
 	"go.temporal.io/sdk/internal/common/util"
 	ilog "go.temporal.io/sdk/internal/log"
@@ -82,6 +79,11 @@ const (
 	defaultPollerRate = 1000
 
 	defaultMaxConcurrentSessionExecutionSize = 1000 // Large concurrent session execution size (1k)
+
+	defaultDeadlockDetectionTimeout = time.Second // By default kill workflow tasks that are running more than 1 sec.
+	// Unlimited deadlock detection timeout is used when we want to allow workflow tasks to run indefinitely, such
+	// as during debugging.
+	unlimitedDeadlockDetectionTimeout = math.MaxInt64
 
 	testTagsContextKey = "temporal-testTags"
 )
@@ -161,7 +163,7 @@ type (
 		// a default option.
 		Identity string
 
-		MetricsScope tally.Scope
+		MetricsHandler metrics.Handler
 
 		Logger log.Logger
 
@@ -195,12 +197,19 @@ type (
 
 		ContextPropagators []ContextPropagator
 
-		Tracer opentracing.Tracer
+		// DeadlockDetectionTimeout specifies workflow task timeout.
+		DeadlockDetectionTimeout time.Duration
+
+		DefaultHeartbeatThrottleInterval time.Duration
+
+		MaxHeartbeatThrottleInterval time.Duration
 
 		// Pointer to the shared worker cache
 		cache *WorkerCache
 	}
 )
+
+var debugMode = os.Getenv("TEMPORAL_DEBUG") != ""
 
 // newWorkflowWorker returns an instance of the workflow worker.
 func newWorkflowWorker(service workflowservice.WorkflowServiceClient, params workerExecutionParameters, ppMgr pressurePointMgr, registry *registry) *workflowWorker {
@@ -216,9 +225,9 @@ func ensureRequiredParams(params *workerExecutionParameters) {
 		params.Logger = ilog.NewDefaultLogger()
 		params.Logger.Info("No logger configured for temporal worker. Created default one.")
 	}
-	if params.MetricsScope == nil {
-		params.MetricsScope = tally.NoopScope
-		params.Logger.Info("No metrics scope configured for temporal worker. Use NoopScope as default.")
+	if params.MetricsHandler == nil {
+		params.MetricsHandler = metrics.NopHandler
+		params.Logger.Info("No metrics handler configured for temporal worker. Use NopHandler as default.")
 	}
 	if params.DataConverter == nil {
 		params.DataConverter = converter.GetDefaultDataConverter()
@@ -227,35 +236,20 @@ func ensureRequiredParams(params *workerExecutionParameters) {
 }
 
 // verifyNamespaceExist does a DescribeNamespace operation on the specified namespace with backoff/retry
-// It returns an error, if the server returns an EntityNotExist or BadRequest error
-// On any other transient error, this method will just return success
-func verifyNamespaceExist(client workflowservice.WorkflowServiceClient, metricsScope tally.Scope, namespace string, logger log.Logger) error {
+func verifyNamespaceExist(
+	client workflowservice.WorkflowServiceClient,
+	metricsHandler metrics.Handler,
+	namespace string,
+	logger log.Logger,
+) error {
 	ctx := context.Background()
-	descNamespaceOp := func() error {
-		grpcCtx, cancel := newGRPCContext(ctx)
-		defer cancel()
-		_, err := client.DescribeNamespace(grpcCtx, &workflowservice.DescribeNamespaceRequest{Namespace: namespace})
-		if err != nil {
-			switch err.(type) {
-			case *serviceerror.NotFound:
-				logger.Error("namespace does not exist", tagNamespace, namespace, tagError, err)
-				return err
-			case *serviceerror.InvalidArgument:
-				logger.Error("namespace does not exist", tagNamespace, namespace, tagError, err)
-				return err
-			}
-			// on any other error, just return true
-			logger.Warn("unable to verify if namespace exist", tagNamespace, namespace, tagError, err)
-		}
-		return nil
-	}
-
 	if namespace == "" {
 		return errors.New("namespace cannot be empty")
 	}
-
-	// exponential backoff retry for upto a minute
-	return backoff.Retry(ctx, descNamespaceOp, createDynamicServiceRetryPolicy(ctx), isServiceTransientError)
+	grpcCtx, cancel := newGRPCContext(ctx, grpcMetricsHandler(metricsHandler), defaultGrpcRetryParameters(ctx))
+	defer cancel()
+	_, err := client.DescribeNamespace(grpcCtx, &workflowservice.DescribeNamespaceRequest{Namespace: namespace})
+	return err
 }
 
 func newWorkflowWorkerInternal(service workflowservice.WorkflowServiceClient, params workerExecutionParameters, ppMgr pressurePointMgr, overrides *workerOverrides, registry *registry) *workflowWorker {
@@ -269,10 +263,16 @@ func newWorkflowWorkerInternal(service workflowservice.WorkflowServiceClient, pa
 	} else {
 		taskHandler = newWorkflowTaskHandler(params, ppMgr, registry)
 	}
-	return newWorkflowTaskWorkerInternal(taskHandler, service, params, workerStopChannel)
+	return newWorkflowTaskWorkerInternal(taskHandler, service, params, workerStopChannel, registry.interceptors)
 }
 
-func newWorkflowTaskWorkerInternal(taskHandler WorkflowTaskHandler, service workflowservice.WorkflowServiceClient, params workerExecutionParameters, stopC chan struct{}) *workflowWorker {
+func newWorkflowTaskWorkerInternal(
+	taskHandler WorkflowTaskHandler,
+	service workflowservice.WorkflowServiceClient,
+	params workerExecutionParameters,
+	stopC chan struct{},
+	interceptors []WorkerInterceptor,
+) *workflowWorker {
 	ensureRequiredParams(&params)
 	poller := newWorkflowTaskPoller(taskHandler, service, params)
 	worker := newBaseWorker(baseWorkerOptions{
@@ -285,7 +285,7 @@ func newWorkflowTaskWorkerInternal(taskHandler WorkflowTaskHandler, service work
 		workerType:        "WorkflowWorker",
 		stopTimeout:       params.WorkerStopTimeout},
 		params.Logger,
-		params.MetricsScope,
+		params.MetricsHandler,
 		nil,
 	)
 
@@ -298,7 +298,7 @@ func newWorkflowTaskWorkerInternal(taskHandler WorkflowTaskHandler, service work
 	}
 
 	// 2) local activity task poller will poll from laTunnel, and result will be pushed to laTunnel
-	localActivityTaskPoller := newLocalActivityPoller(params, laTunnel)
+	localActivityTaskPoller := newLocalActivityPoller(params, laTunnel, interceptors)
 	localActivityWorker := newBaseWorker(baseWorkerOptions{
 		pollerCount:       1, // 1 poller (from local channel) is enough for local activity
 		maxConcurrentTask: params.ConcurrentLocalActivityExecutionSize,
@@ -308,7 +308,7 @@ func newWorkflowTaskWorkerInternal(taskHandler WorkflowTaskHandler, service work
 		workerType:        "LocalActivityWorker",
 		stopTimeout:       params.WorkerStopTimeout},
 		params.Logger,
-		params.MetricsScope,
+		params.MetricsHandler,
 		nil,
 	)
 
@@ -328,7 +328,7 @@ func newWorkflowTaskWorkerInternal(taskHandler WorkflowTaskHandler, service work
 
 // Start the worker.
 func (ww *workflowWorker) Start() error {
-	err := verifyNamespaceExist(ww.workflowService, ww.executionParameters.MetricsScope, ww.executionParameters.Namespace, ww.worker.logger)
+	err := verifyNamespaceExist(ww.workflowService, ww.executionParameters.MetricsHandler, ww.executionParameters.Namespace, ww.worker.logger)
 	if err != nil {
 		return err
 	}
@@ -421,7 +421,7 @@ func newActivityTaskWorker(taskHandler ActivityTaskHandler, service workflowserv
 			stopTimeout:       workerParams.WorkerStopTimeout,
 			userContextCancel: workerParams.UserContextCancel},
 		workerParams.Logger,
-		workerParams.MetricsScope,
+		workerParams.MetricsHandler,
 		sessionTokenBucket,
 	)
 
@@ -437,7 +437,7 @@ func newActivityTaskWorker(taskHandler ActivityTaskHandler, service workflowserv
 
 // Start the worker.
 func (aw *activityWorker) Start() error {
-	err := verifyNamespaceExist(aw.workflowService, aw.executionParameters.MetricsScope, aw.executionParameters.Namespace, aw.worker.logger)
+	err := verifyNamespaceExist(aw.workflowService, aw.executionParameters.MetricsHandler, aw.executionParameters.Namespace, aw.worker.logger)
 	if err != nil {
 		return err
 	}
@@ -453,19 +453,11 @@ func (aw *activityWorker) Stop() {
 
 type registry struct {
 	sync.Mutex
-	workflowFuncMap      map[string]interface{}
-	workflowAliasMap     map[string]string
-	activityFuncMap      map[string]activity
-	activityAliasMap     map[string]string
-	workflowInterceptors []WorkflowInterceptor
-}
-
-func (r *registry) WorkflowInterceptors() []WorkflowInterceptor {
-	return r.workflowInterceptors
-}
-
-func (r *registry) SetWorkflowInterceptors(workflowInterceptors []WorkflowInterceptor) {
-	r.workflowInterceptors = workflowInterceptors
+	workflowFuncMap  map[string]interface{}
+	workflowAliasMap map[string]string
+	activityFuncMap  map[string]activity
+	activityAliasMap map[string]string
+	interceptors     []WorkerInterceptor
 }
 
 func (r *registry) RegisterWorkflow(af interface{}) {
@@ -490,7 +482,7 @@ func (r *registry) RegisterWorkflowWithOptions(
 	if err := validateFnFormat(fnType, true); err != nil {
 		panic(err)
 	}
-	fnName := getFunctionName(wf)
+	fnName, _ := getFunctionName(wf)
 	alias := options.Name
 	registerName := fnName
 	if len(alias) > 0 {
@@ -540,7 +532,7 @@ func (r *registry) RegisterActivityWithOptions(
 	if err := validateFnFormat(fnType, false); err != nil {
 		panic(err)
 	}
-	fnName := getFunctionName(af)
+	fnName, _ := getFunctionName(af)
 	alias := options.Name
 	registerName := fnName
 	if len(alias) > 0 {
@@ -555,7 +547,7 @@ func (r *registry) RegisterActivityWithOptions(
 			panic(fmt.Sprintf("activity type \"%v\" is already registered", registerName))
 		}
 	}
-	r.activityFuncMap[registerName] = &activityExecutor{registerName, af}
+	r.activityFuncMap[registerName] = &activityExecutor{name: registerName, fn: af}
 	if len(alias) > 0 {
 		r.activityAliasMap[fnName] = alias
 	}
@@ -581,7 +573,7 @@ func (r *registry) registerActivityStructWithOptions(aStruct interface{}, option
 				continue
 			}
 
-			return fmt.Errorf("method %v of %v: %e", name, structType.Name(), err)
+			return fmt.Errorf("method %s of %s: %w", name, structType.Name(), err)
 		}
 		registerName := options.Name + name
 		if !options.DisableAlreadyRegisteredCheck {
@@ -589,7 +581,7 @@ func (r *registry) registerActivityStructWithOptions(aStruct interface{}, option
 				return fmt.Errorf("activity type \"%v\" is already registered", registerName)
 			}
 		}
-		r.activityFuncMap[registerName] = &activityExecutor{registerName, methodValue.Interface()}
+		r.activityFuncMap[registerName] = &activityExecutor{name: registerName, fn: methodValue.Interface()}
 		count++
 	}
 	if count == 0 {
@@ -681,12 +673,8 @@ func (r *registry) getWorkflowDefinition(wt WorkflowType) (WorkflowDefinition, e
 	if ok {
 		return wdf.NewWorkflowDefinition(), nil
 	}
-	executor := &workflowExecutor{workflowType: lookup, fn: wf, interceptors: r.getInterceptors()}
+	executor := &workflowExecutor{workflowType: lookup, fn: wf, interceptors: r.interceptors}
 	return newSyncWorkflowDefinition(executor), nil
-}
-
-func (r *registry) getInterceptors() []WorkflowInterceptor {
-	return r.workflowInterceptors
 }
 
 // Validate function parameters.
@@ -741,32 +729,37 @@ func newRegistry() *registry {
 type workflowExecutor struct {
 	workflowType string
 	fn           interface{}
-	interceptors []WorkflowInterceptor
+	interceptors []WorkerInterceptor
 }
 
 func (we *workflowExecutor) Execute(ctx Context, input *commonpb.Payloads) (*commonpb.Payloads, error) {
-	var args []interface{}
 	dataConverter := WithWorkflowContext(ctx, getWorkflowEnvOptions(ctx).DataConverter)
 	fnType := reflect.TypeOf(we.fn)
 
-	decoded, err := decodeArgsToValues(dataConverter, fnType, input)
+	args, err := decodeArgsToRawValues(dataConverter, fnType, input)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"unable to decode the workflow function input payload with error: %w, function name: %v",
 			err, we.workflowType)
 	}
-	args = append(args, decoded...)
 
 	envInterceptor := getWorkflowEnvironmentInterceptor(ctx)
 	envInterceptor.fn = we.fn
-	results := envInterceptor.inboundInterceptor.ExecuteWorkflow(ctx, we.workflowType, args...)
-	return serializeResults(we.fn, results, dataConverter)
+
+	// Execute and serialize result
+	result, err := envInterceptor.inboundInterceptor.ExecuteWorkflow(ctx, &ExecuteWorkflowInput{Args: args})
+	var serializedResult *commonpb.Payloads
+	if err == nil && result != nil {
+		serializedResult, err = encodeArg(dataConverter, result)
+	}
+	return serializedResult, err
 }
 
 // Wrapper to execute activity functions.
 type activityExecutor struct {
-	name string
-	fn   interface{}
+	name             string
+	fn               interface{}
+	skipInterceptors bool
 }
 
 func (ae *activityExecutor) ActivityType() ActivityType {
@@ -779,56 +772,42 @@ func (ae *activityExecutor) GetFunction() interface{} {
 
 func (ae *activityExecutor) Execute(ctx context.Context, input *commonpb.Payloads) (*commonpb.Payloads, error) {
 	fnType := reflect.TypeOf(ae.fn)
-	var args []reflect.Value
 	dataConverter := getDataConverterFromActivityCtx(ctx)
 
-	// activities optionally might not take context.
-	if fnType.NumIn() > 0 && isActivityContext(fnType.In(0)) {
-		args = append(args, reflect.ValueOf(ctx))
-	}
-
-	decoded, err := decodeArgs(dataConverter, fnType, input)
+	args, err := decodeArgsToRawValues(dataConverter, fnType, input)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"unable to decode the activity function input payload with error: %w for function name: %v",
 			err, ae.name)
 	}
-	args = append(args, decoded...)
 
-	fnValue := reflect.ValueOf(ae.fn)
-	retValues := fnValue.Call(args)
-	return validateFunctionAndGetResults(ae.fn, retValues, dataConverter)
+	return ae.ExecuteWithActualArgs(ctx, args)
 }
 
-func (ae *activityExecutor) ExecuteWithActualArgs(ctx context.Context, actualArgs []interface{}) (*commonpb.Payloads, error) {
-	retValues := ae.executeWithActualArgsWithoutParseResult(ctx, actualArgs)
+func (ae *activityExecutor) ExecuteWithActualArgs(ctx context.Context, args []interface{}) (*commonpb.Payloads, error) {
 	dataConverter := getDataConverterFromActivityCtx(ctx)
 
-	return validateFunctionAndGetResults(ae.fn, retValues, dataConverter)
-}
+	envInterceptor := getActivityEnvironmentInterceptor(ctx)
+	envInterceptor.fn = ae.fn
 
-func (ae *activityExecutor) executeWithActualArgsWithoutParseResult(ctx context.Context, actualArgs []interface{}) []reflect.Value {
-	fnType := reflect.TypeOf(ae.fn)
-	var args []reflect.Value
-
-	// activities optionally might not take context.
-	argsOffeset := 0
-	if fnType.NumIn() > 0 && isActivityContext(fnType.In(0)) {
-		args = append(args, reflect.ValueOf(ctx))
-		argsOffeset = 1
+	// Execute and serialize result
+	interceptor := envInterceptor.inboundInterceptor
+	if ae.skipInterceptors {
+		interceptor = envInterceptor
 	}
-
-	for i, arg := range actualArgs {
-		if arg == nil {
-			args = append(args, reflect.New(fnType.In(i+argsOffeset)).Elem())
-		} else {
-			args = append(args, reflect.ValueOf(arg))
+	result, resultErr := interceptor.ExecuteActivity(ctx, &ExecuteActivityInput{Args: args})
+	var serializedResult *commonpb.Payloads
+	if result != nil {
+		// As a special case, if the result is already a payload, just use it
+		var ok bool
+		if serializedResult, ok = result.(*commonpb.Payloads); !ok {
+			var err error
+			if serializedResult, err = encodeArg(dataConverter, result); err != nil {
+				return nil, err
+			}
 		}
 	}
-
-	fnValue := reflect.ValueOf(ae.fn)
-	retValues := fnValue.Call(args)
-	return retValues
+	return serializedResult, resultErr
 }
 
 func getDataConverterFromActivityCtx(ctx context.Context) converter.DataConverter {
@@ -890,30 +869,23 @@ func (aw *AggregatedWorker) RegisterActivityWithOptions(a interface{}, options R
 
 // Start the worker in a non-blocking fashion.
 func (aw *AggregatedWorker) Start() error {
+	aw.assertNotStopped()
 	if err := initBinaryChecksum(); err != nil {
 		return fmt.Errorf("failed to get executable checksum: %v", err)
 	}
 
 	if !util.IsInterfaceNil(aw.workflowWorker) {
-		if len(aw.registry.getRegisteredWorkflowTypes()) == 0 {
-			aw.logger.Debug("No workflows registered. Skipping workflow worker start")
-		} else {
-			if err := aw.workflowWorker.Start(); err != nil {
-				return err
-			}
+		if err := aw.workflowWorker.Start(); err != nil {
+			return err
 		}
 	}
 	if !util.IsInterfaceNil(aw.activityWorker) {
-		if len(aw.registry.getRegisteredActivities()) == 0 {
-			aw.logger.Debug("No activities registered. Skipping activity worker start")
-		} else {
-			if err := aw.activityWorker.Start(); err != nil {
-				// stop workflow worker.
-				if aw.workflowWorker.worker.isWorkerStarted {
-					aw.workflowWorker.Stop()
-				}
-				return err
+		if err := aw.activityWorker.Start(); err != nil {
+			// stop workflow worker.
+			if aw.workflowWorker.worker.isWorkerStarted {
+				aw.workflowWorker.Stop()
 			}
+			return err
 		}
 	}
 
@@ -932,6 +904,18 @@ func (aw *AggregatedWorker) Start() error {
 	}
 	aw.logger.Info("Started Worker")
 	return nil
+}
+
+func (aw *AggregatedWorker) assertNotStopped() {
+	stopped := true
+	select {
+	case <-aw.stopC:
+	default:
+		stopped = false
+	}
+	if stopped {
+		panic("attempted to start a worker that has been stopped before")
+	}
 }
 
 var binaryChecksum string
@@ -1038,12 +1022,23 @@ func (aw *AggregatedWorker) Stop() {
 
 // WorkflowReplayer is used to replay workflow code from an event history
 type WorkflowReplayer struct {
-	registry *registry
+	registry      *registry
+	dataConverter converter.DataConverter
 }
 
-// NewWorkflowReplayer creates an instance of the WorkflowReplayer
-func NewWorkflowReplayer() *WorkflowReplayer {
-	return &WorkflowReplayer{registry: newRegistry()}
+// WorkflowReplayerOptions are options for creating a workflow replayer.
+type WorkflowReplayerOptions struct {
+	// Optional custom data converter to provide for replay. If not set, the
+	// default converter is used.
+	DataConverter converter.DataConverter
+}
+
+// NewWorkflowReplayer creates an instance of the WorkflowReplayer.
+func NewWorkflowReplayer(options WorkflowReplayerOptions) (*WorkflowReplayer, error) {
+	return &WorkflowReplayer{
+		registry:      newRegistry(),
+		dataConverter: options.DataConverter,
+	}, nil
 }
 
 // RegisterWorkflow registers workflow function to replay
@@ -1081,21 +1076,21 @@ func (aw *WorkflowReplayer) ReplayWorkflowHistoryFromJSONFile(logger log.Logger,
 // lastEventID(inclusive).
 // Use for testing the backwards compatibility of code changes and troubleshooting workflows in a debugger.
 // The logger is an optional parameter. Defaults to the noop logger.
-func (aw *WorkflowReplayer) ReplayPartialWorkflowHistoryFromJSONFile(loger log.Logger, jsonfileName string, lastEventID int64) error {
+func (aw *WorkflowReplayer) ReplayPartialWorkflowHistoryFromJSONFile(logger log.Logger, jsonfileName string, lastEventID int64) error {
 	history, err := extractHistoryFromFile(jsonfileName, lastEventID)
 
 	if err != nil {
 		return err
 	}
 
-	if loger == nil {
-		loger = ilog.NewDefaultLogger()
+	if logger == nil {
+		logger = ilog.NewDefaultLogger()
 	}
 
-	controller := gomock.NewController(ilog.NewTestReporter(loger))
+	controller := gomock.NewController(ilog.NewTestReporter(logger))
 	service := workflowservicemock.NewMockWorkflowServiceClient(controller)
 
-	return aw.replayWorkflowHistory(loger, service, ReplayNamespace, history)
+	return aw.replayWorkflowHistory(logger, service, ReplayNamespace, history)
 }
 
 // ReplayWorkflowExecution replays workflow execution loading it from Temporal service.
@@ -1129,7 +1124,7 @@ func (aw *WorkflowReplayer) ReplayWorkflowExecution(ctx context.Context, service
 	return aw.replayWorkflowHistory(logger, service, namespace, hResponse.History)
 }
 
-func (aw *WorkflowReplayer) replayWorkflowHistory(loger log.Logger, service workflowservice.WorkflowServiceClient, namespace string, history *historypb.History) error {
+func (aw *WorkflowReplayer) replayWorkflowHistory(logger log.Logger, service workflowservice.WorkflowServiceClient, namespace string, history *historypb.History) error {
 	taskQueue := "ReplayTaskQueue"
 	events := history.Events
 	if events == nil {
@@ -1172,16 +1167,16 @@ func (aw *WorkflowReplayer) replayWorkflowHistory(loger log.Logger, service work
 		namespace:     ReplayNamespace,
 		service:       service,
 		maxEventID:    task.GetStartedEventId(),
-		metricsScope:  nil,
 		taskQueue:     taskQueue,
 	}
 	cache := NewWorkerCache()
 	params := workerExecutionParameters{
-		Namespace: namespace,
-		TaskQueue: taskQueue,
-		Identity:  "replayID",
-		Logger:    loger,
-		cache:     cache,
+		Namespace:     namespace,
+		TaskQueue:     taskQueue,
+		Identity:      "replayID",
+		Logger:        logger,
+		cache:         cache,
+		DataConverter: aw.dataConverter,
 	}
 	taskHandler := newWorkflowTaskHandler(params, nil, aw.registry)
 	resp, err := taskHandler.ProcessWorkflowTask(&workflowTask{task: task, historyIterator: iterator}, nil)
@@ -1278,7 +1273,7 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		ConcurrentWorkflowTaskExecutionSize:   options.MaxConcurrentWorkflowTaskExecutionSize,
 		MaxConcurrentWorkflowTaskQueuePollers: options.MaxConcurrentWorkflowTaskPollers,
 		Identity:                              client.identity,
-		MetricsScope:                          client.metricsScope,
+		MetricsHandler:                        client.metricsHandler,
 		Logger:                                client.logger,
 		EnableLoggingInReplay:                 options.EnableLoggingInReplay,
 		UserContext:                           backgroundActivityContext,
@@ -1289,7 +1284,9 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		DataConverter:                         client.dataConverter,
 		WorkerStopTimeout:                     options.WorkerStopTimeout,
 		ContextPropagators:                    client.contextPropagators,
-		Tracer:                                client.tracer,
+		DeadlockDetectionTimeout:              options.DeadlockDetectionTimeout,
+		DefaultHeartbeatThrottleInterval:      options.DefaultHeartbeatThrottleInterval,
+		MaxHeartbeatThrottleInterval:          options.MaxHeartbeatThrottleInterval,
 		cache:                                 cache,
 	}
 
@@ -1308,7 +1305,10 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 
 	// worker specific registry
 	registry := newRegistry()
-	registry.SetWorkflowInterceptors(options.WorkflowInterceptorChainFactories)
+	// Build set of interceptors using the applicable client ones first (being
+	// careful not to append to the existing slice)
+	registry.interceptors = make([]WorkerInterceptor, 0, len(client.workerInterceptors)+len(options.Interceptors))
+	registry.interceptors = append(append(registry.interceptors, client.workerInterceptors...), options.Interceptors...)
 
 	// workflow factory.
 	var workflowWorker *workflowWorker
@@ -1383,11 +1383,14 @@ func isError(inType reflect.Type) bool {
 	return inType != nil && inType.Implements(errorElem)
 }
 
-func getFunctionName(i interface{}) string {
+func getFunctionName(i interface{}) (name string, isMethod bool) {
 	if fullName, ok := i.(string); ok {
-		return fullName
+		return fullName, false
 	}
 	fullName := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+	// Full function name that has a struct pointer receiver has the following format
+	// <prefix>.(*<type>).<function>
+	isMethod = strings.ContainsAny(fullName, "*")
 	elements := strings.Split(fullName, ".")
 	shortName := elements[len(elements)-1]
 	// This allows to call activities by method pointer
@@ -1398,11 +1401,11 @@ func getFunctionName(i interface{}) string {
 	// var a *Activities
 	// ExecuteActivity(ctx, a.Foo)
 	// will call this function which is going to return "Foo"
-	return strings.TrimSuffix(shortName, "-fm")
+	return strings.TrimSuffix(shortName, "-fm"), isMethod
 }
 
 func getActivityFunctionName(r *registry, i interface{}) string {
-	result := getFunctionName(i)
+	result, _ := getFunctionName(i)
 	if alias, ok := r.getActivityAlias(result); ok {
 		result = alias
 	}
@@ -1416,7 +1419,7 @@ func getWorkflowFunctionName(r *registry, workflowFunc interface{}) (string, err
 	case reflect.String:
 		fnName = reflect.ValueOf(workflowFunc).String()
 	case reflect.Func:
-		fnName = getFunctionName(workflowFunc)
+		fnName, _ = getFunctionName(workflowFunc)
 		if alias, ok := r.getWorkflowAlias(fnName); ok {
 			fnName = alias
 		}
@@ -1462,6 +1465,18 @@ func setWorkerOptionsDefaults(options *WorkerOptions) {
 	if options.MaxConcurrentSessionExecutionSize == 0 {
 		options.MaxConcurrentSessionExecutionSize = defaultMaxConcurrentSessionExecutionSize
 	}
+	if options.DeadlockDetectionTimeout == 0 {
+		if debugMode {
+			options.DeadlockDetectionTimeout = unlimitedDeadlockDetectionTimeout
+		}
+		options.DeadlockDetectionTimeout = defaultDeadlockDetectionTimeout
+	}
+	if options.DefaultHeartbeatThrottleInterval == 0 {
+		options.DefaultHeartbeatThrottleInterval = defaultDefaultHeartbeatThrottleInterval
+	}
+	if options.MaxHeartbeatThrottleInterval == 0 {
+		options.MaxHeartbeatThrottleInterval = defaultMaxHeartbeatThrottleInterval
+	}
 }
 
 // setClientDefaults should be needed only in unit tests.
@@ -1472,11 +1487,8 @@ func setClientDefaults(client *WorkflowClient) {
 	if client.namespace == "" {
 		client.namespace = DefaultNamespace
 	}
-	if client.tracer == nil {
-		client.tracer = opentracing.NoopTracer{}
-	}
-	if client.metricsScope == nil {
-		client.metricsScope = tally.NoopScope
+	if client.metricsHandler == nil {
+		client.metricsHandler = metrics.NopHandler
 	}
 }
 
@@ -1489,4 +1501,53 @@ func getTestTags(ctx context.Context) map[string]map[string]string {
 		}
 	}
 	return nil
+}
+
+// Same as executeFunction but injects the context as the first parameter if the
+// function takes it (regardless of existing parameters).
+func executeFunctionWithContext(ctx context.Context, fn interface{}, args []interface{}) (interface{}, error) {
+	if fnType := reflect.TypeOf(fn); fnType.NumIn() > 0 && isActivityContext(fnType.In(0)) {
+		args = append([]interface{}{ctx}, args...)
+	}
+	return executeFunction(fn, args)
+}
+
+// Executes function and ensures that there is always 1 or 2 results and second
+// result is error.
+func executeFunction(fn interface{}, args []interface{}) (interface{}, error) {
+	fnValue := reflect.ValueOf(fn)
+	reflectArgs := make([]reflect.Value, len(args))
+	for i, arg := range args {
+		// If the argument is nil, use zero value
+		if arg == nil {
+			reflectArgs[i] = reflect.New(fnValue.Type().In(i)).Elem()
+		} else {
+			reflectArgs[i] = reflect.ValueOf(arg)
+		}
+	}
+	retValues := fnValue.Call(reflectArgs)
+
+	// Expect either error or (result, error)
+	if len(retValues) == 0 || len(retValues) > 2 {
+		fnName, _ := getFunctionName(fn)
+		return nil, fmt.Errorf(
+			"the function: %v signature returns %d results, it is expecting to return either error or (result, error)",
+			fnName, len(retValues))
+	}
+	// Convert error
+	var err error
+	if errResult := retValues[len(retValues)-1].Interface(); errResult != nil {
+		var ok bool
+		if err, ok = errResult.(error); !ok {
+			return nil, fmt.Errorf(
+				"failed to serialize error result as it is not of error interface: %v",
+				errResult)
+		}
+	}
+	// If there are two results, convert the first only if it's not a nil pointer
+	var res interface{}
+	if len(retValues) > 1 && (retValues[0].Kind() != reflect.Ptr || !retValues[0].IsNil()) {
+		res = retValues[0].Interface()
+	}
+	return res, err
 }

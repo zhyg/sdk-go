@@ -34,15 +34,12 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/opentracing/opentracing-go"
-	"github.com/uber-go/tally"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
-
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common"
 	"go.temporal.io/sdk/internal/common/metrics"
@@ -119,20 +116,20 @@ type (
 		currentReplayTime time.Time // Indicates current replay time of the command.
 		currentLocalTime  time.Time // Local time when currentReplayTime was updated.
 
-		completeHandler completionHandler                           // events completion handler
-		cancelHandler   func()                                      // A cancel handler to be invoked on a cancel notification
-		signalHandler   func(name string, input *commonpb.Payloads) // A signal handler to be invoked on a signal event
-		queryHandler    func(queryType string, queryArgs *commonpb.Payloads) (*commonpb.Payloads, error)
+		completeHandler completionHandler                                                          // events completion handler
+		cancelHandler   func()                                                                     // A cancel handler to be invoked on a cancel notification
+		signalHandler   func(name string, input *commonpb.Payloads, header *commonpb.Header) error // A signal handler to be invoked on a signal event
+		queryHandler    func(queryType string, queryArgs *commonpb.Payloads, header *commonpb.Header) (*commonpb.Payloads, error)
 
 		logger                log.Logger
 		isReplay              bool // flag to indicate if workflow is in replay mode
 		enableLoggingInReplay bool // flag to indicate if workflow should enable logging in replay mode
 
-		metricsScope       tally.Scope
-		registry           *registry
-		dataConverter      converter.DataConverter
-		contextPropagators []ContextPropagator
-		tracer             opentracing.Tracer
+		metricsHandler           metrics.Handler
+		registry                 *registry
+		dataConverter            converter.DataConverter
+		contextPropagators       []ContextPropagator
+		deadlockDetectionTimeout time.Duration
 	}
 
 	localActivityTask struct {
@@ -173,27 +170,27 @@ func newWorkflowExecutionEventHandler(
 	completeHandler completionHandler,
 	logger log.Logger,
 	enableLoggingInReplay bool,
-	scope tally.Scope,
+	metricsHandler metrics.Handler,
 	registry *registry,
 	dataConverter converter.DataConverter,
 	contextPropagators []ContextPropagator,
-	tracer opentracing.Tracer,
+	deadlockDetectionTimeout time.Duration,
 ) workflowExecutionEventHandler {
 	context := &workflowEnvironmentImpl{
-		workflowInfo:          workflowInfo,
-		commandsHelper:        newCommandsHelper(),
-		sideEffectResult:      make(map[int64]*commonpb.Payloads),
-		mutableSideEffect:     make(map[string]*commonpb.Payloads),
-		changeVersions:        make(map[string]Version),
-		pendingLaTasks:        make(map[string]*localActivityTask),
-		unstartedLaTasks:      make(map[string]struct{}),
-		openSessions:          make(map[string]*SessionInfo),
-		completeHandler:       completeHandler,
-		enableLoggingInReplay: enableLoggingInReplay,
-		registry:              registry,
-		dataConverter:         dataConverter,
-		contextPropagators:    contextPropagators,
-		tracer:                tracer,
+		workflowInfo:             workflowInfo,
+		commandsHelper:           newCommandsHelper(),
+		sideEffectResult:         make(map[int64]*commonpb.Payloads),
+		mutableSideEffect:        make(map[string]*commonpb.Payloads),
+		changeVersions:           make(map[string]Version),
+		pendingLaTasks:           make(map[string]*localActivityTask),
+		unstartedLaTasks:         make(map[string]struct{}),
+		openSessions:             make(map[string]*SessionInfo),
+		completeHandler:          completeHandler,
+		enableLoggingInReplay:    enableLoggingInReplay,
+		registry:                 registry,
+		dataConverter:            dataConverter,
+		contextPropagators:       contextPropagators,
+		deadlockDetectionTimeout: deadlockDetectionTimeout,
 	}
 	context.logger = ilog.NewReplayLogger(
 		log.With(logger,
@@ -205,9 +202,9 @@ func newWorkflowExecutionEventHandler(
 		&context.isReplay,
 		&context.enableLoggingInReplay)
 
-	if scope != nil {
-		replayAwareScope := metrics.WrapScope(&context.isReplay, scope, context)
-		context.metricsScope = metrics.GetMetricsScopeForWorkflow(replayAwareScope, workflowInfo.WorkflowType.Name)
+	if metricsHandler != nil {
+		context.metricsHandler = metrics.NewReplayAwareHandler(&context.isReplay, metricsHandler).
+			WithTags(metrics.WorkflowTags(workflowInfo.WorkflowType.Name))
 	}
 
 	return &workflowExecutionEventHandlerImpl{context, nil}
@@ -235,6 +232,15 @@ func (s *scheduledChildWorkflow) handle(result *commonpb.Payloads, err error) {
 	}
 	s.handled = true
 	s.resultCallback(result, err)
+}
+
+func (s *scheduledChildWorkflow) handleFailedToStart(result *commonpb.Payloads, err error) {
+	if s.handled {
+		panic(fmt.Sprintf("child workflow already handled %v", s))
+	}
+	s.handled = true
+	s.resultCallback(result, err)
+	s.startedCallback(WorkflowExecution{}, err)
 }
 
 func (t *localActivityTask) cancel() {
@@ -292,11 +298,21 @@ func (wc *workflowEnvironmentImpl) RequestCancelExternalWorkflow(namespace, work
 	command.setData(&scheduledCancellation{callback: callback})
 }
 
-func (wc *workflowEnvironmentImpl) SignalExternalWorkflow(namespace, workflowID, runID, signalName string,
-	input *commonpb.Payloads, _ /* THIS IS FOR TEST FRAMEWORK. DO NOT USE HERE. */ interface{}, childWorkflowOnly bool, callback ResultHandler) {
+func (wc *workflowEnvironmentImpl) SignalExternalWorkflow(
+	namespace string,
+	workflowID string,
+	runID string,
+	signalName string,
+	input *commonpb.Payloads,
+	_ /* THIS IS FOR TEST FRAMEWORK. DO NOT USE HERE. */ interface{},
+	header *commonpb.Header,
+	childWorkflowOnly bool,
+	callback ResultHandler,
+) {
 
 	signalID := wc.GenerateSequenceID()
-	command := wc.commandsHelper.signalExternalWorkflowExecution(namespace, workflowID, runID, signalName, input, signalID, childWorkflowOnly)
+	command := wc.commandsHelper.signalExternalWorkflowExecution(namespace, workflowID, runID, signalName, input,
+		header, signalID, childWorkflowOnly)
 	command.setData(&scheduledSignal{callback: callback})
 }
 
@@ -408,11 +424,15 @@ func (wc *workflowEnvironmentImpl) ExecuteChildWorkflow(
 		tagWorkflowType, params.WorkflowType.Name)
 }
 
-func (wc *workflowEnvironmentImpl) RegisterSignalHandler(handler func(name string, input *commonpb.Payloads)) {
+func (wc *workflowEnvironmentImpl) RegisterSignalHandler(
+	handler func(name string, input *commonpb.Payloads, header *commonpb.Header) error,
+) {
 	wc.signalHandler = handler
 }
 
-func (wc *workflowEnvironmentImpl) RegisterQueryHandler(handler func(string, *commonpb.Payloads) (*commonpb.Payloads, error)) {
+func (wc *workflowEnvironmentImpl) RegisterQueryHandler(
+	handler func(string, *commonpb.Payloads, *commonpb.Header) (*commonpb.Payloads, error),
+) {
 	wc.queryHandler = handler
 }
 
@@ -420,8 +440,8 @@ func (wc *workflowEnvironmentImpl) GetLogger() log.Logger {
 	return wc.logger
 }
 
-func (wc *workflowEnvironmentImpl) GetMetricsScope() tally.Scope {
-	return wc.metricsScope
+func (wc *workflowEnvironmentImpl) GetMetricsHandler() metrics.Handler {
+	return wc.metricsHandler
 }
 
 func (wc *workflowEnvironmentImpl) GetDataConverter() converter.DataConverter {
@@ -761,7 +781,7 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessEvent(
 	}
 	defer func() {
 		if p := recover(); p != nil {
-			weh.metricsScope.Counter(metrics.WorkflowTaskExecutionFailureCounter).Inc(1)
+			weh.metricsHandler.Counter(metrics.WorkflowTaskExecutionFailureCounter).Inc(1)
 			topLine := fmt.Sprintf("process event for %s [panic]:", weh.workflowInfo.TaskQueueName)
 			st := getStackTraceRaw(topLine, 7, 0)
 			weh.Complete(nil, newWorkflowPanicError(p, st))
@@ -792,7 +812,7 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessEvent(
 		weh.SetCurrentReplayTime(common.TimeValue(event.GetEventTime()))
 		// Reset the counter on command helper used for generating ID for commands
 		weh.commandsHelper.setCurrentWorkflowTaskStartedEventID(event.GetEventId())
-		weh.workflowDefinition.OnWorkflowTaskStarted()
+		weh.workflowDefinition.OnWorkflowTaskStarted(weh.deadlockDetectionTimeout)
 
 	case enumspb.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT:
 		// No Operation
@@ -851,7 +871,7 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessEvent(
 		// No Operation.
 
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED:
-		weh.handleWorkflowExecutionSignaled(event.GetWorkflowExecutionSignaledEventAttributes())
+		err = weh.handleWorkflowExecutionSignaled(event.GetWorkflowExecutionSignaledEventAttributes())
 
 	case enumspb.EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED:
 		signalID := event.GetSignalExternalWorkflowExecutionInitiatedEventAttributes().Control
@@ -909,20 +929,24 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessEvent(
 	// workflow task started. So always call OnWorkflowTaskStarted on the last event.
 	// Don't call for EventType_WorkflowTaskStarted as it was already called when handling it.
 	if isLast && event.GetEventType() != enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED {
-		weh.workflowDefinition.OnWorkflowTaskStarted()
+		weh.workflowDefinition.OnWorkflowTaskStarted(weh.deadlockDetectionTimeout)
 	}
 
 	return nil
 }
 
-func (weh *workflowExecutionEventHandlerImpl) ProcessQuery(queryType string, queryArgs *commonpb.Payloads) (*commonpb.Payloads, error) {
+func (weh *workflowExecutionEventHandlerImpl) ProcessQuery(
+	queryType string,
+	queryArgs *commonpb.Payloads,
+	header *commonpb.Header,
+) (*commonpb.Payloads, error) {
 	switch queryType {
 	case QueryTypeStackTrace:
 		return weh.encodeArg(weh.StackTrace())
 	case QueryTypeOpenSessions:
 		return weh.encodeArg(weh.getOpenSessions())
 	default:
-		result, err := weh.queryHandler(queryType, queryArgs)
+		result, err := weh.queryHandler(queryType, queryArgs, header)
 		if err != nil {
 			return nil, err
 		}
@@ -1133,8 +1157,8 @@ func (weh *workflowExecutionEventHandlerImpl) handleMarkerRecorded(
 func (weh *workflowExecutionEventHandlerImpl) handleLocalActivityMarker(details map[string]*commonpb.Payloads, failure *failurepb.Failure) error {
 	var markerData *commonpb.Payloads
 	var ok bool
-	if markerData, ok = details[localActivityMarkerDataDetailsName]; !ok {
-		return fmt.Errorf("key %q: %w", localActivityMarkerDataDetailsName, ErrMissingMarkerDataKey)
+	if markerData, ok = details[localActivityMarkerDataName]; !ok {
+		return fmt.Errorf("key %q: %w", localActivityMarkerDataName, ErrMissingMarkerDataKey)
 	}
 
 	lamd := localActivityMarkerData{}
@@ -1157,12 +1181,8 @@ func (weh *workflowExecutionEventHandlerImpl) handleLocalActivityMarker(details 
 			lar.Backoff = lamd.Backoff
 			lar.Err = ConvertFailureToError(failure, weh.GetDataConverter())
 		} else {
-			var result *commonpb.Payloads
-			var ok bool
-			if result, ok = details[localActivityMarkerResultDetailsName]; !ok {
-				return fmt.Errorf("key %q: %w", localActivityMarkerResultDetailsName, ErrMissingMarkerDataKey)
-			}
-			lar.Result = result
+			// Result might not be there if local activity doesn't have return value.
+			lar.Result = details[localActivityResultName]
 		}
 		la.callback(lar)
 
@@ -1170,7 +1190,7 @@ func (weh *workflowExecutionEventHandlerImpl) handleLocalActivityMarker(details 
 		weh.SetCurrentReplayTime(lamd.ReplayTime)
 
 		// resume workflow execution after apply local activity result
-		weh.workflowDefinition.OnWorkflowTaskStarted()
+		weh.workflowDefinition.OnWorkflowTaskStarted(weh.deadlockDetectionTimeout)
 	}
 
 	return nil
@@ -1188,11 +1208,8 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessLocalActivityResult(lar *lo
 	}
 	if lar.err != nil {
 		lamd.Backoff = lar.backoff
-	} else {
-		details[localActivityMarkerResultDetailsName] = lar.result
-		if details[localActivityMarkerResultDetailsName] == nil {
-			details[localActivityMarkerResultDetailsName] = &commonpb.Payloads{}
-		}
+	} else if lar.result != nil {
+		details[localActivityResultName] = lar.result
 	}
 
 	// encode marker data
@@ -1200,7 +1217,7 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessLocalActivityResult(lar *lo
 	if err != nil {
 		return err
 	}
-	details[localActivityMarkerDataDetailsName] = markerData
+	details[localActivityMarkerDataName] = markerData
 
 	// create marker event for local activity result
 	markerEvent := &historypb.HistoryEvent{
@@ -1217,8 +1234,8 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessLocalActivityResult(lar *lo
 }
 
 func (weh *workflowExecutionEventHandlerImpl) handleWorkflowExecutionSignaled(
-	attributes *historypb.WorkflowExecutionSignaledEventAttributes) {
-	weh.signalHandler(attributes.GetSignalName(), attributes.Input)
+	attributes *historypb.WorkflowExecutionSignaledEventAttributes) error {
+	return weh.signalHandler(attributes.GetSignalName(), attributes.Input, attributes.Header)
 }
 
 func (weh *workflowExecutionEventHandlerImpl) handleStartChildWorkflowExecutionFailed(event *historypb.HistoryEvent) error {
@@ -1239,9 +1256,9 @@ func (weh *workflowExecutionEventHandlerImpl) handleStartChildWorkflowExecutionF
 			attributes.GetInitiatedEventId(),
 			0,
 			enumspb.RETRY_STATE_NON_RETRYABLE_FAILURE,
-			errors.New("workflow execution already started"),
+			&ChildWorkflowExecutionAlreadyStartedError{},
 		)
-		childWorkflow.handle(nil, err)
+		childWorkflow.handleFailedToStart(nil, err)
 		return nil
 	}
 

@@ -30,8 +30,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
-	"github.com/uber-go/tally"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -55,8 +53,9 @@ const (
 	// sessions in the workflow. The result will be a list of SessionInfo encoded in the EncodedValue.
 	QueryTypeOpenSessions string = "__open_sessions"
 
-	healthCheckServiceName    = "temporal.api.workflowservice.v1.WorkflowService"
-	defaultHealthCheckTimeout = 5 * time.Second
+	healthCheckServiceName           = "temporal.api.workflowservice.v1.WorkflowService"
+	defaultHealthCheckAttemptTimeout = 5 * time.Second
+	defaultHealthCheckTimeout        = 10 * time.Second
 )
 
 type (
@@ -70,9 +69,10 @@ type (
 		//     or
 		//     ExecuteWorkflow(ctx, options, workflowExecuteFn, arg1, arg2, arg3)
 		// The errors it can return:
-		//	- EntityNotExistsError, if namespace does not exists
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound, if namespace does not exists
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		//
 		// The current timeout resolution implementation is in seconds and uses math.Ceil(d.Seconds()) as the duration. But is
 		// subjected to change in the future.
@@ -112,19 +112,22 @@ type (
 		// - runID can be default(empty string). if empty string then it will pick the running execution of that workflow ID.
 		// - signalName name to identify the signal.
 		// The errors it can return:
-		//	- EntityNotExistsError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		SignalWorkflow(ctx context.Context, workflowID string, runID string, signalName string, arg interface{}) error
 
 		// SignalWithStartWorkflow sends a signal to a running workflow.
 		// If the workflow is not running or not found, it starts the workflow and then sends the signal in transaction.
 		// - workflowID, signalName, signalArg are same as SignalWorkflow's parameters
 		// - options, workflow, workflowArgs are same as StartWorkflow's parameters
+		// - the workflowID parameter is used instead of options.ID. If the latter is present, it must match the workflowID.
 		// Note: options.WorkflowIDReusePolicy is default to AllowDuplicate.
 		// The errors it can return:
-		//  - EntityNotExistsError, if namespace does not exist
-		//  - BadRequestError
-		//	- InternalServiceError
+		//  - serviceerror.NotFound, if namespace does not exist
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		SignalWithStartWorkflow(ctx context.Context, workflowID string, signalName string, signalArg interface{},
 			options StartWorkflowOptions, workflow interface{}, workflowArgs ...interface{}) (WorkflowRun, error)
 
@@ -132,9 +135,10 @@ type (
 		// - workflow ID of the workflow.
 		// - runID can be default(empty string). if empty string then it will pick the running execution of that workflow ID.
 		// The errors it can return:
-		//	- EntityNotExistsError
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		CancelWorkflow(ctx context.Context, workflowID string, runID string) error
 
 		// TerminateWorkflow terminates a workflow execution.
@@ -142,9 +146,10 @@ type (
 		// - workflow ID of the workflow.
 		// - runID can be default(empty string). if empty string then it will pick the running execution of that workflow ID.
 		// The errors it can return:
-		//	- EntityNotExistsError
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string, details ...interface{}) error
 
 		// GetWorkflowHistory gets history events of a particular workflow
@@ -169,7 +174,7 @@ type (
 
 		// CompleteActivity reports activity completed.
 		// activity Execute method can return acitivity.activity.ErrResultPending to
-		// indicate the activity is not completed when it's Execute method returns. In that case, this CompleteActivity() method
+		// indicate the activity is not completed when it's Execut	e method returns. In that case, this CompleteActivity() method
 		// should be called when that activity is completed with the actual result and error. If err is nil, activity task
 		// completed event will be reported; if err is CanceledError, activity task canceled event will be reported; otherwise,
 		// activity task failed event will be reported.
@@ -179,7 +184,7 @@ type (
 		//  	CompleteActivity(token, "Done", nil)
 		//	To fail the activity with an error.
 		//      CompleteActivity(token, nil, temporal.NewApplicationError("reason", details)
-		// The activity can fail with below errors ErrorWithDetails, TimeoutError, CanceledError.
+		// The activity can fail with below errors ApplicationError, TimeoutError, CanceledError.
 		CompleteActivity(ctx context.Context, taskToken []byte, result interface{}, err error) error
 
 		// CompleteActivityByID reports activity completed.
@@ -192,7 +197,7 @@ type (
 		// An activity implementation should use activityID provided in ActivityOption to use for completion.
 		// namespace name, workflowID, activityID are required, runID is optional.
 		// The errors it can return:
-		//  - ErrorWithDetails
+		//  - ApplicationError
 		//  - TimeoutError
 		//  - CanceledError
 		CompleteActivityByID(ctx context.Context, namespace, workflowID, runID, activityID string, result interface{}, err error) error
@@ -200,33 +205,37 @@ type (
 		// RecordActivityHeartbeat records heartbeat for an activity.
 		// details - is the progress you want to record along with heart beat for this activity.
 		// The errors it can return:
-		//	- EntityNotExistsError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		RecordActivityHeartbeat(ctx context.Context, taskToken []byte, details ...interface{}) error
 
 		// RecordActivityHeartbeatByID records heartbeat for an activity.
 		// details - is the progress you want to record along with heart beat for this activity.
 		// The errors it can return:
-		//	- EntityNotExistsError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		RecordActivityHeartbeatByID(ctx context.Context, namespace, workflowID, runID, activityID string, details ...interface{}) error
 
 		// ListClosedWorkflow gets closed workflow executions based on request filters
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
-		//  - EntityNotExistError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
+		//  - serviceerror.NotFound
 		ListClosedWorkflow(ctx context.Context, request *workflowservice.ListClosedWorkflowExecutionsRequest) (*workflowservice.ListClosedWorkflowExecutionsResponse, error)
 
 		// ListOpenWorkflow gets open workflow executions based on request filters
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
-		//  - EntityNotExistError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
+		//  - serviceerror.NotFound
 		ListOpenWorkflow(ctx context.Context, request *workflowservice.ListOpenWorkflowExecutionsRequest) (*workflowservice.ListOpenWorkflowExecutionsResponse, error)
 
 		// ListWorkflow gets workflow executions based on query. This API only works with ElasticSearch,
-		// and will return BadRequestError when using Cassandra or MySQL. The query is basically the SQL WHERE clause,
+		// and will return serviceerror.InvalidArgument when using Cassandra or MySQL. The query is basically the SQL WHERE clause,
 		// examples:
 		//  - "(WorkflowID = 'wid1' or (WorkflowType = 'type2' and WorkflowID = 'wid2'))".
 		//  - "CloseTime between '2019-08-27T15:04:05+00:00' and '2019-08-28T15:04:05+00:00'".
@@ -234,8 +243,9 @@ type (
 		// Retrieved workflow executions are sorted by StartTime in descending order when list open workflow,
 		// and sorted by CloseTime in descending order for other queries.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		ListWorkflow(ctx context.Context, request *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error)
 
 		// ListArchivedWorkflow gets archived workflow executions based on query. This API will return BadRequest if Temporal
@@ -243,27 +253,30 @@ type (
 		// However, different visibility archivers have different limitations on the query. Please check the documentation of the visibility archiver used
 		// by your namespace to see what kind of queries are accept and whether retrieved workflow executions are ordered or not.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		ListArchivedWorkflow(ctx context.Context, request *workflowservice.ListArchivedWorkflowExecutionsRequest) (*workflowservice.ListArchivedWorkflowExecutionsResponse, error)
 
 		// ScanWorkflow gets workflow executions based on query. This API only works with ElasticSearch,
-		// and will return BadRequestError when using Cassandra or MySQL. The query is basically the SQL WHERE clause
+		// and will return serviceerror.InvalidArgument when using Cassandra or MySQL. The query is basically the SQL WHERE clause
 		// (see ListWorkflow for query examples).
 		// ScanWorkflow should be used when retrieving large amount of workflows and order is not needed.
 		// It will use more ElasticSearch resources than ListWorkflow, but will be several times faster
 		// when retrieving millions of workflows.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		ScanWorkflow(ctx context.Context, request *workflowservice.ScanWorkflowExecutionsRequest) (*workflowservice.ScanWorkflowExecutionsResponse, error)
 
 		// CountWorkflow gets number of workflow executions based on query. This API only works with ElasticSearch,
-		// and will return BadRequestError when using Cassandra or MySQL. The query is basically the SQL WHERE clause
+		// and will return serviceerror.InvalidArgument when using Cassandra or MySQL. The query is basically the SQL WHERE clause
 		// (see ListWorkflow for query examples).
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		CountWorkflow(ctx context.Context, request *workflowservice.CountWorkflowExecutionsRequest) (*workflowservice.CountWorkflowExecutionsResponse, error)
 
 		// GetSearchAttributes returns valid search attributes keys and value types.
@@ -285,40 +298,49 @@ type (
 		// - queryType is the type of the query.
 		// - args... are the optional query parameters.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
-		//  - EntityNotExistError
-		//  - QueryFailError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
+		//  - serviceerror.NotFound
+		//  - serviceerror.QueryFailed
 		QueryWorkflow(ctx context.Context, workflowID string, runID string, queryType string, args ...interface{}) (converter.EncodedValue, error)
 
 		// QueryWorkflowWithOptions queries a given workflow execution and returns the query result synchronously.
 		// See QueryWorkflowWithOptionsRequest and QueryWorkflowWithOptionsResponse for more information.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
-		//  - EntityNotExistError
-		//  - QueryFailError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
+		//  - serviceerror.NotFound
+		//  - serviceerror.QueryFailed
 		QueryWorkflowWithOptions(ctx context.Context, request *QueryWorkflowWithOptionsRequest) (*QueryWorkflowWithOptionsResponse, error)
 
 		// DescribeWorkflowExecution returns information about the specified workflow execution.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
-		//  - EntityNotExistError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
+		//  - serviceerror.NotFound
 		DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error)
 
 		// DescribeTaskQueue returns information about the target taskqueue, right now this API returns the
 		// pollers which polled this taskqueue in last few minutes.
 		// The errors it can return:
-		//  - BadRequestError
-		//  - InternalServiceError
-		//  - EntityNotExistError
+		//  - serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
+		//  - serviceerror.NotFound
 		DescribeTaskQueue(ctx context.Context, taskqueue string, taskqueueType enumspb.TaskQueueType) (*workflowservice.DescribeTaskQueueResponse, error)
 
 		// ResetWorkflowExecution reset an existing workflow execution to WorkflowTaskFinishEventId(exclusive).
 		// And it will immediately terminating the current execution instance.
 		// RequestId is used to deduplicate requests. It will be autogenerated if not set.
 		ResetWorkflowExecution(ctx context.Context, request *workflowservice.ResetWorkflowExecutionRequest) (*workflowservice.ResetWorkflowExecutionResponse, error)
+
+		// WorkflowService provides access to the underlying gRPC service. This should only be used for advanced use cases
+		// that cannot be accomplished via other Client methods. Unlike calls to other Client methods, calls directly to the
+		// service are not configured with internal semantics such as automatic retries.
+		WorkflowService() workflowservice.WorkflowServiceClient
 
 		// Close client and clean up underlying resources.
 		Close()
@@ -327,8 +349,23 @@ type (
 	// ClientOptions are optional parameters for Client creation.
 	ClientOptions struct {
 		// Optional: To set the host:port for this client to connect to.
-		// Use "dns:///" prefix to enable DNS based round-robin.
 		// default: localhost:7233
+		//
+		// This is a gRPC address and therefore can also support a special-formatted address of "<resolver>:///<value>" that
+		// will use a registered resolver. By default all hosts returned from the resolver will be used in a round-robin
+		// fashion.
+		//
+		// The "dns" resolver is registered by default. Using a "dns:///" prefixed address will periodically resolve all IPs
+		// for DNS address given and round robin amongst them.
+		//
+		// A custom resolver can be created to provide multiple hosts in other ways. For example, to manually provide
+		// multiple IPs to round-robin across, a google.golang.org/grpc/resolver/manual resolver can be created and
+		// registered with google.golang.org/grpc/resolver with a custom scheme:
+		//		builder := manual.NewBuilderWithScheme("myresolver")
+		//		builder.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: "1.2.3.4:1234"}, {Addr: "2.3.4.5:2345"}}})
+		//		resolver.Register(builder)
+		//		c, err := client.NewClient(client.Options{HostPort: "myresolver:///ignoredvalue"})
+		// Other more advanced resolvers can also be registered.
 		HostPort string
 
 		// Optional: To set the namespace name for this client to work with.
@@ -339,51 +376,17 @@ type (
 		// default: default logger provided.
 		Logger log.Logger
 
-		// Optional: Metrics to be reported.
-		// Default metrics are Prometheus compatible but default separator (.) should be replaced with some other character:
-		// opts := tally.ScopeOptions{
-		//   Separator: "_",
-		// }
-		// scope, _ := tally.NewRootScope(opts, time.Second)
-		//
-		// If you have custom metrics make sure they are compatible with Prometheus or create tally scope with sanitizer options set:
-		// var (
-		//   safeCharacters = []rune{'_'}
-		//   sanitizeOptions = tally.SanitizeOptions{
-		// 		NameCharacters: tally.ValidCharacters{
-		// 			Ranges:     tally.AlphanumericRange,
-		// 			Characters: _safeCharacters,
-		// 		},
-		// 		KeyCharacters: tally.ValidCharacters{
-		// 			Ranges:     tally.AlphanumericRange,
-		// 			Characters: _safeCharacters,
-		// 		},
-		// 		ValueCharacters: tally.ValidCharacters{
-		// 			Ranges:     tally.AlphanumericRange,
-		// 			Characters: _safeCharacters,
-		// 		},
-		// 		ReplacementCharacter: tally.DefaultReplacementCharacter,
-		// 	}
-		// )
-		// opts := tally.ScopeOptions{
-		// 	 SanitizeOptions: &sanitizeOptions,
-		//   Separator: "_",
-		// }
-		// scope, _ := tally.NewRootScope(opts, time.Second)
+		// Optional: Metrics handler for reporting metrics.
 		// default: no metrics.
-		MetricsScope tally.Scope
+		MetricsHandler metrics.Handler
 
 		// Optional: Sets an identify that can be used to track this host for debugging.
 		// default: default identity that include hostname, groupName and process ID.
 		Identity string
 
 		// Optional: Sets DataConverter to customize serialization/deserialization of arguments in Temporal
-		// default: defaultDataConverter, an combination of thriftEncoder and jsonEncoder
+		// default: defaultDataConverter, an combination of google protobuf converter, gogo protobuf converter and json converter
 		DataConverter converter.DataConverter
-
-		// Optional: Sets opentracing Tracer that is to be used to emit tracing information
-		// default: no tracer - opentracing.NoopTracer
-		Tracer opentracing.Tracer
 
 		// Optional: Sets ContextPropagators that allows users to control the context information passed through a workflow
 		// default: nil
@@ -396,11 +399,32 @@ type (
 		// Optional: HeadersProvider will be invoked on every outgoing gRPC request and gives user ability to
 		// set custom request headers. This can be used to set auth headers for example.
 		HeadersProvider HeadersProvider
+
+		// Optional parameter that is designed to be used *in tests*. It gets invoked last in
+		// the gRPC interceptor chain and can be used to induce artificial failures in test scenarios.
+		TrafficController TrafficController
+
+		// Interceptors to apply to some calls of the client. Earlier interceptors
+		// wrap later interceptors.
+		//
+		// Any interceptors that also implement Interceptor (meaning they implement
+		// WorkerInterceptor in addition to ClientInterceptor) will be used for
+		// worker interception as well. When worker interceptors are here and in
+		// worker options, the ones here wrap the ones in worker options. The same
+		// interceptor should not be set here and in worker options.
+		Interceptors []ClientInterceptor
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.
 	HeadersProvider interface {
 		GetHeaders(ctx context.Context) (map[string]string, error)
+	}
+
+	// TrafficController is getting called in the interceptor chain with API invocation parameters.
+	// Result is either nil if API call is allowed or an error, in which case request would be interrupted and
+	// the error will be propagated back through the interceptor chain.
+	TrafficController interface {
+		CheckCallAllowed(ctx context.Context, method string, req, reply interface{}) error
 	}
 
 	// ConnectionOptions is provided by SDK consumers to control optional connection params.
@@ -417,8 +441,12 @@ type (
 		// Set DisableHealthCheck to true to disable it.
 		DisableHealthCheck bool
 
-		// HealthCheckTimeout specifies how to long to wait while checking server connection when creating new client.
+		// HealthCheckAttemptTimeout specifies how to long to wait for service response on each health check attempt.
 		// Default: 5s.
+		HealthCheckAttemptTimeout time.Duration
+
+		// HealthCheckTimeout defines how long client should be sending health check requests to the server before concluding
+		// that it is unavailable. Defaults to 10s, once this timeout is reached error will be propagated to the client.
 		HealthCheckTimeout time.Duration
 
 		// Enables keep alive ping from client to the server, which can help detect abruptly closed connections faster.
@@ -438,6 +466,19 @@ type (
 		// when there are no active RPCs, Time and Timeout will be ignored and no
 		// keepalive pings will be sent.
 		KeepAlivePermitWithoutStream bool
+
+		// MaxPayloadSize is a number of bytes that gRPC would allow to travel to and from server. Defaults to 64 MB.
+		MaxPayloadSize int
+
+		// Advanced dial options for gRPC connections. These are applied after the internal default dial options are
+		// applied. Therefore any dial options here may override internal ones.
+		//
+		// For gRPC interceptors, internal interceptors such as error handling, metrics, and retrying are done via
+		// grpc.WithChainUnaryInterceptor. Therefore to add inner interceptors that are wrapped by those, a
+		// grpc.WithChainUnaryInterceptor can be added as an option here. To add a single outer interceptor, a
+		// grpc.WithUnaryInterceptor option can be added since grpc.WithUnaryInterceptor is prepended to chains set with
+		// grpc.WithChainUnaryInterceptor.
+		DialOptions []grpc.DialOption
 	}
 
 	// StartWorkflowOptions configuration parameters for starting a workflow execution.
@@ -519,10 +560,10 @@ type (
 	// history only when the activity completes or "finally" timeouts/fails. And the started event only records the last
 	// started time. Because of that, to check an activity has started or not, you cannot rely on history events. Instead,
 	// you can use CLI to describe the workflow to see the status of the activity:
-	//     temporal --do <namespace> wf desc -w <wf-id>
+	//     tctl --ns <namespace> wf desc -w <wf-id>
 	RetryPolicy struct {
 		// Backoff interval for the first retry. If BackoffCoefficient is 1.0 then it is used for all retries.
-		// Required, no default value.
+		// If not set or set to 0, a default interval of 1s will be used.
 		InitialInterval time.Duration
 
 		// Coefficient used to calculate the next retry backoff interval.
@@ -551,8 +592,9 @@ type (
 		// Register a namespace with temporal server
 		// The errors it can throw:
 		//	- NamespaceAlreadyExistsError
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		Register(ctx context.Context, request *workflowservice.RegisterNamespaceRequest) error
 
 		// Describe a namespace. The namespace has 3 part of information
@@ -560,16 +602,18 @@ type (
 		// NamespaceConfiguration - Configuration like Workflow Execution Retention Period In Days, Whether to emit metrics.
 		// ReplicationConfiguration - replication config like clusters and active cluster name
 		// The errors it can throw:
-		//	- EntityNotExistsError
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		Describe(ctx context.Context, name string) (*workflowservice.DescribeNamespaceResponse, error)
 
 		// Update a namespace.
 		// The errors it can throw:
-		//	- EntityNotExistsError
-		//	- BadRequestError
-		//	- InternalServiceError
+		//	- serviceerror.NotFound
+		//	- serviceerror.InvalidArgument
+		//	- serviceerror.Internal
+		//	- serviceerror.Unavailable
 		Update(ctx context.Context, request *workflowservice.UpdateNamespaceRequest) error
 
 		// Close client and clean up underlying resources.
@@ -583,8 +627,11 @@ func NewClient(options ClientOptions) (Client, error) {
 		options.Namespace = DefaultNamespace
 	}
 
-	// Initializes the root metric scope.  These tags are included on each metric which creates a child scope from it.
-	options.MetricsScope = metrics.GetRootScope(options.MetricsScope, options.Namespace)
+	// Initialize root tags
+	if options.MetricsHandler == nil {
+		options.MetricsHandler = metrics.NopHandler
+	}
+	options.MetricsHandler = options.MetricsHandler.WithTags(metrics.RootTags(options.Namespace))
 
 	if options.HostPort == "" {
 		options.HostPort = LocalHostPort
@@ -607,7 +654,7 @@ func newDialParameters(options *ClientOptions) dialParameters {
 	return dialParameters{
 		UserConnectionOptions: options.ConnectionOptions,
 		HostPort:              options.HostPort,
-		RequiredInterceptors:  requiredInterceptors(options.MetricsScope, options.HeadersProvider),
+		RequiredInterceptors:  requiredInterceptors(options.MetricsHandler, options.HeadersProvider, options.TrafficController),
 		DefaultServiceConfig:  defaultServiceConfig,
 	}
 }
@@ -627,30 +674,47 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		options.DataConverter = converter.GetDefaultDataConverter()
 	}
 
-	if options.Tracer != nil {
-		options.ContextPropagators = append(options.ContextPropagators, NewTracingContextPropagator(options.Logger, options.Tracer))
-	} else {
-		options.Tracer = opentracing.NoopTracer{}
+	if options.MetricsHandler == nil {
+		options.MetricsHandler = metrics.NopHandler
 	}
 
-	return &WorkflowClient{
+	// Collect set of applicable worker interceptors
+	var workerInterceptors []WorkerInterceptor
+	for _, interceptor := range options.Interceptors {
+		if workerInterceptor, _ := interceptor.(WorkerInterceptor); workerInterceptor != nil {
+			workerInterceptors = append(workerInterceptors, workerInterceptor)
+		}
+	}
+
+	client := &WorkflowClient{
 		workflowService:    workflowServiceClient,
 		connectionCloser:   connectionCloser,
 		namespace:          options.Namespace,
 		registry:           newRegistry(),
-		metricsScope:       options.MetricsScope,
+		metricsHandler:     options.MetricsHandler,
 		logger:             options.Logger,
 		identity:           options.Identity,
 		dataConverter:      options.DataConverter,
 		contextPropagators: options.ContextPropagators,
-		tracer:             options.Tracer,
+		workerInterceptors: workerInterceptors,
 	}
+
+	// Create outbound interceptor by wrapping backwards through chain
+	client.interceptor = &workflowClientInterceptor{client: client}
+	for i := len(options.Interceptors) - 1; i >= 0; i-- {
+		client.interceptor = options.Interceptors[i].InterceptClient(client.interceptor)
+	}
+
+	return client
 }
 
 // NewNamespaceClient creates an instance of a namespace client, to manager lifecycle of namespaces.
 func NewNamespaceClient(options ClientOptions) (NamespaceClient, error) {
-	// Initializes the root metric scope.  These tags are included on each metric which creates a child scope from it.
-	options.MetricsScope = metrics.GetRootScope(options.MetricsScope, metrics.NoneTagValue)
+	// Initialize root tags
+	if options.MetricsHandler == nil {
+		options.MetricsHandler = metrics.NopHandler
+	}
+	options.MetricsHandler = options.MetricsHandler.WithTags(metrics.RootTags(metrics.NoneTagValue))
 
 	if options.HostPort == "" {
 		options.HostPort = LocalHostPort
@@ -672,7 +736,7 @@ func newNamespaceServiceClient(workflowServiceClient workflowservice.WorkflowSer
 	return &namespaceClient{
 		workflowService:  workflowServiceClient,
 		connectionCloser: clientConn,
-		metricsScope:     options.MetricsScope,
+		metricsHandler:   options.MetricsHandler,
 		logger:           options.Logger,
 		identity:         options.Identity,
 	}
